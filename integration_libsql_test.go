@@ -360,3 +360,41 @@ func TestIntegrationReaderTokenCannotWrite(t *testing.T) {
 		t.Fatalf("reader token write status = %d, want 403", resp.StatusCode)
 	}
 }
+
+func TestIntegrationAggregatesUseTheLocalPlan(t *testing.T) {
+	db := openFixtureDB(t)
+	items := dal.NewRootCollectionRef("items", "")
+	query := dal.From(&items).NewQuery().SelectColumns(dal.Count())
+
+	reader, err := db.ExecuteQueryToRecordsReader(context.Background(), query)
+	if err != nil {
+		t.Fatalf("ExecuteQueryToRecordsReader(count): %v", err)
+	}
+	rec, err := reader.Next()
+	if err != nil {
+		t.Fatalf("Next(count): %v", err)
+	}
+	data := rec.Data().(map[string]any)
+	if data["COUNT(*)"] != 12 && data["COUNT(*)"] != int64(12) {
+		t.Fatalf("record count = %#v", data)
+	}
+	_ = reader.Close()
+
+	rsReader, err := db.ExecuteQueryToRecordsetReader(context.Background(), query)
+	if err != nil {
+		t.Fatalf("ExecuteQueryToRecordsetReader(count): %v", err)
+	}
+	defer func() { _ = rsReader.Close() }()
+	row, rs, err := rsReader.Next()
+	if err != nil {
+		t.Fatalf("Next(count recordset): %v", err)
+	}
+	name := rs.Columns()[0].Name()
+	count, err := row.GetValueByName(name, rs)
+	if err != nil {
+		t.Fatalf("count value: %v", err)
+	}
+	if count != 12 && count != int64(12) {
+		t.Fatalf("recordset count = %#v", count)
+	}
+}

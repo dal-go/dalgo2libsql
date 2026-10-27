@@ -10,8 +10,11 @@ HTTP pipeline directly. No account, no management API, no migrations.
   `Config.Recordsets`; the declaration is validated against the live catalog
   before a statement is sent. The key is never assumed to be `id`.
 - Structured read-only queries, via the published `dalgo2sql` SQLite compiler:
-  projection, filter, `ORDER BY`, `LIMIT`/`OFFSET`, grouping, aggregates, and
-  record and recordset readers.
+  projection, filter, `ORDER BY`, `LIMIT`/`OFFSET`, and record and recordset
+  readers. Grouping and aggregates are planned by DALgo's local strategy:
+  the adapter does not claim native aggregation, because an aggregate result
+  column has no declared type and the current recordset reader cannot hold it
+  (see the gaps below).
 - The five borrowed `dbschema.SchemaReader` methods from the published
   `dalgo2sqlite` package.
 - `Close`, idempotently.
@@ -40,6 +43,12 @@ accepted only for loopback hosts with `AllowLoopbackHTTP: true`. Credentials,
 queries, fragments, and API suffixes in the URL are refused.
 
 See [`examples/readonly`](examples/readonly/main.go) for a full program.
+
+`LIMIT`/`OFFSET` are sent to the server. A structured read can run more than
+one statement (a catalog probe, then the data statement) on one connection,
+but it is **not** a snapshot: two calls can see different data if the database
+changes between them. Ordering is stable across calls only when the query names
+an explicit `ORDER BY`; the adapter never promises a stable order without one.
 
 ## Bounds and safety
 
@@ -75,8 +84,12 @@ limitations. The adapter does not claim the affected behaviour until they land.
    A storage-preserving delegate needs one additive `dalgo2sql` option, for
    example `DbOptions.PreserveNativeStorageClasses`, that (a) stops the records
    reader's `[]byte`→`string` and NUMERIC normalisation, (b) makes the recordset
-   reader create an `any`-typed column instead of one derived from `ScanType`,
-   and (c) applies the same rule to the keyed `Get` map path.
+   reader create an `any`-typed column instead of one derived from `ScanType`
+   (this also covers aggregate and expression columns, whose declared type is
+   null), and (c) applies the same rule to the keyed `Get` map path. Until it
+   exists, `QueryCapabilities` does not claim native grouping or aggregation;
+   DALgo computes them locally and the results are correct, just not pushed
+   down.
 
 2. **`DescribeCollection` with a read-only token.** `dalgo2sqlite` v0.5.0
    checks foreign-key enforcement with a bare `PRAGMA foreign_keys`.

@@ -531,3 +531,13 @@ func TestBackendDoesNotEchoServerText(t *testing.T) {
 		}
 	}
 }
+
+func TestBackendAdvertisesOnlyCarriedCapabilities(t *testing.T) {
+	caps := (&database{}).QueryCapabilities()
+	if !caps.OrderBy {
+		t.Error("ORDER BY is carried but not advertised")
+	}
+	if caps.GroupBy || caps.Having || caps.Aggregate.Count || caps.Aggregate.OrderBy {
+		t.Fatalf("capabilities overclaim native grouping or aggregation: %#v", caps)
+	}
+}

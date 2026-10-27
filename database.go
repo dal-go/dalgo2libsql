@@ -68,24 +68,17 @@ func (d *database) Adapter() dal.Adapter { return dal.NewAdapter("dalgo2libsql",
 // Schema returns the key-mapping schema. The adapter does not invent one.
 func (d *database) Schema() dal.Schema { return d.schema }
 
-// QueryCapabilities explicitly advertises only what this backend runs
-// natively. SQLite's GROUP BY, HAVING, ORDER BY and the aggregate subset are
-// compiled to SQL and verified by the server; joins are not advertised and
-// are refused, because their preflight needs a stateful transaction this
-// checkpoint does not implement. No stable row order and no aggregate-local
-// ORDER BY is claimed.
+// QueryCapabilities explicitly advertises only what this backend runs natively
+// and preserves exactly for both readers. ORDER BY is safe. GROUP BY, HAVING
+// and the aggregate subset are not advertised: SQLite compiles them, but
+// dalgo2sql v0.30.5 types a recordset column from driver.RowsColumnTypeScanType,
+// and an aggregate or expression column has no declared type, so the recordset
+// reader refuses the value it delivered (see README, known gaps). DALgo then
+// plans those queries with its local strategy over the reads this backend does
+// preserve, instead of receiving a capability claim the recordset path cannot
+// honour.
 func (d *database) QueryCapabilities() dal.QueryCapabilities {
-	return dal.QueryCapabilities{
-		GroupBy: true,
-		Having:  true,
-		OrderBy: true,
-		Aggregate: dal.AggregateCapabilities{
-			Count: true, CountDistinct: true,
-			Sum: true, SumDistinct: true,
-			Avg: true, AvgDistinct: true,
-			Min: true, Max: true,
-		},
-	}
+	return dal.QueryCapabilities{OrderBy: true}
 }
 
 // Get reads one record through its declared primary key. A collection whose

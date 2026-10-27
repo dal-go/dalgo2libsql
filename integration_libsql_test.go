@@ -177,6 +177,33 @@ func TestIntegrationStructuredReadsStayStable(t *testing.T) {
 	read()
 	read()
 
+	// A float and a blob survive through a recordset read of the real server,
+	// not only through a record.
+	scalar := dal.NewQueryBuilder(dal.From(&collection)).
+		WhereField("id", dal.Equal, int64(1)).
+		SelectColumns(
+			dal.Column{Expression: dal.Field("id")},
+			dal.Column{Expression: dal.Field("score")},
+			dal.Column{Expression: dal.Field("payload")},
+		)
+	scalarReader, err := db.ExecuteQueryToRecordsetReader(context.Background(), scalar)
+	if err != nil {
+		t.Fatalf("ExecuteQueryToRecordsetReader(scalar): %v", err)
+	}
+	scalarRow, scalarSet, err := scalarReader.Next()
+	if err != nil {
+		t.Fatalf("Next(scalar): %v", err)
+	}
+	if score, err := scalarRow.GetValueByName("score", scalarSet); err != nil || score != 9.5 {
+		t.Fatalf("recordset score = %#v, %v", score, err)
+	}
+	if payload, err := scalarRow.GetValueByName("payload", scalarSet); err != nil || !reflect.DeepEqual(payload, []byte{0x00, 0xff, 0x10}) {
+		t.Fatalf("recordset payload = %#v, %v", payload, err)
+	}
+	if err := scalarReader.Close(); err != nil {
+		t.Fatalf("close scalar reader: %v", err)
+	}
+
 	// Fractions and their order survive a full scan of a REAL primary key.
 	metrics := dal.NewRootCollectionRef("metrics", "")
 	ratioQuery := dal.NewQueryBuilder(dal.From(&metrics)).

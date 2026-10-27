@@ -356,13 +356,14 @@ function runChild(command, argv, env) {
 }
 
 async function main() {
-  const separator = process.argv.indexOf("--");
-  const command = separator === -1 ? [] : process.argv.slice(separator + 1);
-  if (command[0] === "--check-pins") {
+  const args = process.argv.slice(2);
+  if (args[0] === "--check-pins") {
     const metadata = verifyPinnedImage();
     process.stdout.write(`${JSON.stringify(metadata, null, 2)}\n`);
     return 0;
   }
+  const separator = args.indexOf("--");
+  const command = separator === -1 ? [] : args.slice(separator + 1);
 
   const fixture = await startLibSQLFixture();
   log(`container ${fixture.name} at ${fixture.url} (image ${fixture.image})`);

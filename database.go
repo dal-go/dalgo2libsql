@@ -8,6 +8,7 @@ import (
 	"io"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/dal-go/dalgo/dal"
 	"github.com/dal-go/dalgo/dbschema"
@@ -37,6 +38,7 @@ type database struct {
 	pool     *sql.DB
 	client   *hrana.Client
 	limits   hrana.Limits
+	timeout  time.Duration
 
 	recordsets map[string]*dalgo2sql.Recordset
 	declared   map[string]string
@@ -89,18 +91,20 @@ func (d *database) QueryCapabilities() dal.QueryCapabilities {
 // key is not declared, or whose declaration does not match the live schema,
 // is refused before any statement is sent.
 func (d *database) Get(ctx context.Context, rec dalrecord.Record) error {
-	if err := d.ready(ctx, rec); err != nil {
-		if rec != nil {
-			rec.SetError(err)
-		}
-		return err
+	if rec == nil {
+		return fmt.Errorf("%w: nil record", ErrInvalidConfig)
 	}
-	if err := d.validateRecordset(ctx, rec.Key().Collection()); err != nil {
+	op, err := d.begin(ctx)
+	if err != nil {
 		rec.SetError(err)
 		return err
 	}
-	err := d.delegate.Get(d.withBudget(ctx), rec)
-	if err != nil {
+	defer op.done()
+	if err := d.validateRecordset(op.ctx, rec.Key().Collection()); err != nil {
+		rec.SetError(err)
+		return err
+	}
+	if err := d.delegate.Get(op.ctx, rec); err != nil {
 		safe := sanitizeReadError(err)
 		rec.SetError(safe)
 		return safe
@@ -111,16 +115,18 @@ func (d *database) Get(ctx context.Context, rec dalrecord.Record) error {
 // Exists reports whether a record with the key exists, through the same
 // declared and validated key.
 func (d *database) Exists(ctx context.Context, key *dalrecord.Key) (bool, error) {
-	if err := d.ready(ctx, nil); err != nil {
+	op, err := d.begin(ctx)
+	if err != nil {
 		return false, err
 	}
+	defer op.done()
 	if key == nil {
 		return false, fmt.Errorf("%w: nil key", ErrInvalidConfig)
 	}
-	if err := d.validateRecordset(ctx, key.Collection()); err != nil {
+	if err := d.validateRecordset(op.ctx, key.Collection()); err != nil {
 		return false, err
 	}
-	exists, err := d.delegate.Exists(d.withBudget(ctx), key)
+	exists, err := d.delegate.Exists(op.ctx, key)
 	if err != nil {
 		return false, sanitizeReadError(err)
 	}
@@ -128,49 +134,115 @@ func (d *database) Exists(ctx context.Context, key *dalrecord.Key) (bool, error)
 }
 
 // GetMulti reads several records by key. Every target collection must have a
-// validated declaration; the check happens before the first statement.
+// validated declaration; the check happens before the first statement, and
+// every catalog probe shares the operation's deadline and budget.
 func (d *database) GetMulti(ctx context.Context, records []dalrecord.Record) error {
-	if err := d.ready(ctx, nil); err != nil {
+	op, err := d.begin(ctx)
+	if err != nil {
 		return err
 	}
+	defer op.done()
 	for _, rec := range records {
 		if rec == nil {
 			return fmt.Errorf("%w: a nil record", ErrInvalidConfig)
 		}
-		if err := d.validateRecordset(ctx, rec.Key().Collection()); err != nil {
+		if err := d.validateRecordset(op.ctx, rec.Key().Collection()); err != nil {
 			return err
 		}
 	}
-	if err := d.delegate.GetMulti(d.withBudget(ctx), records); err != nil {
+	if err := d.delegate.GetMulti(op.ctx, records); err != nil {
 		return sanitizeReadError(err)
 	}
 	return nil
 }
 
+// ExecuteQueryToRecordsReader compiles and runs one structured read. The
+// operation's deadline and budget stay alive until the returned reader is
+// closed, exhausted, or the caller's context ends: the reader is not returned
+// with a cancelled context.
 func (d *database) ExecuteQueryToRecordsReader(ctx context.Context, query dal.Query) (dal.RecordsReader, error) {
-	if err := d.ready(ctx, nil); err != nil {
+	op, err := d.begin(ctx)
+	if err != nil {
 		return nil, err
 	}
 	if err := d.checkQuery(query); err != nil {
+		op.done()
 		return nil, err
 	}
-	if err := d.validateDeclaredRecordsets(ctx); err != nil {
-		return nil, err
+	if err := d.validateDeclaredRecordsets(op.ctx); err != nil {
+		op.done()
+		return nil, sanitizeReadError(err)
 	}
-	return d.delegate.ExecuteQueryToRecordsReader(d.withBudget(ctx), query)
+	reader, err := d.delegate.ExecuteQueryToRecordsReader(op.ctx, query)
+	if err != nil {
+		op.done()
+		return nil, sanitizeReadError(err)
+	}
+	return &boundedRecordsReader{RecordsReader: reader, op: op}, nil
 }
 
+// ExecuteQueryToRecordsetReader is the recordset counterpart of
+// ExecuteQueryToRecordsReader.
 func (d *database) ExecuteQueryToRecordsetReader(ctx context.Context, query dal.Query, options ...recordset.Option) (dal.RecordsetReader, error) {
-	if err := d.ready(ctx, nil); err != nil {
+	op, err := d.begin(ctx)
+	if err != nil {
 		return nil, err
 	}
 	if err := d.checkQuery(query); err != nil {
+		op.done()
 		return nil, err
 	}
-	if err := d.validateDeclaredRecordsets(ctx); err != nil {
-		return nil, err
+	if err := d.validateDeclaredRecordsets(op.ctx); err != nil {
+		op.done()
+		return nil, sanitizeReadError(err)
 	}
-	return d.delegate.ExecuteQueryToRecordsetReader(d.withBudget(ctx), query, options...)
+	reader, err := d.delegate.ExecuteQueryToRecordsetReader(op.ctx, query, options...)
+	if err != nil {
+		op.done()
+		return nil, sanitizeReadError(err)
+	}
+	return &boundedRecordsetReader{RecordsetReader: reader, op: op}, nil
+}
+
+// boundedRecordsReader keeps the operation's deadline and budget alive until
+// the reader is closed or reaches its end.
+type boundedRecordsReader struct {
+	dal.RecordsReader
+	op *operation
+}
+
+func (r *boundedRecordsReader) Next() (dalrecord.Record, error) {
+	rec, err := r.RecordsReader.Next()
+	if err != nil {
+		r.op.done()
+	}
+	return rec, err
+}
+
+func (r *boundedRecordsReader) Close() error {
+	err := r.RecordsReader.Close()
+	r.op.done()
+	return err
+}
+
+// boundedRecordsetReader is the recordset counterpart.
+type boundedRecordsetReader struct {
+	dal.RecordsetReader
+	op *operation
+}
+
+func (r *boundedRecordsetReader) Next() (recordset.Row, recordset.Recordset, error) {
+	row, rs, err := r.RecordsetReader.Next()
+	if err != nil {
+		r.op.done()
+	}
+	return row, rs, err
+}
+
+func (r *boundedRecordsetReader) Close() error {
+	err := r.RecordsetReader.Close()
+	r.op.done()
+	return err
 }
 
 // RunReadonlyTransaction is not implemented: a real read-only transaction
@@ -211,14 +283,45 @@ func (d *database) Close() error {
 	return d.closeErr
 }
 
-func (d *database) ready(ctx context.Context, _ dalrecord.Record) error {
+// operation is the single bounded scope of one public call. Every catalog,
+// schema and data statement made for that call shares its deadline and its
+// cumulative counters.
+type operation struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	budget *hrana.Budget
+}
+
+func (o *operation) done() {
+	if o != nil && o.cancel != nil {
+		o.cancel()
+	}
+}
+
+// begin establishes the operation's deadline and budget before any preflight,
+// header provider call or statement. A context that already carries a budget
+// is a nested part of an open operation: it is reused as it is, so a reader
+// keeps the deadline and counters it was created with.
+func (d *database) begin(ctx context.Context) (*operation, error) {
 	if ctx == nil {
-		return fmt.Errorf("%w: nil context", ErrInvalidConfig)
+		return nil, fmt.Errorf("%w: nil context", ErrInvalidConfig)
 	}
 	if d.closed.Load() {
-		return fmt.Errorf("%w: the database is closed", ErrNotSupported)
+		return nil, fmt.Errorf("%w: the database is closed", ErrNotSupported)
 	}
-	return ctx.Err()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if budget := hrana.BudgetFrom(ctx); budget != nil {
+		return &operation{ctx: ctx, budget: budget}, nil
+	}
+	budget := hrana.NewBudget(d.limits)
+	opCtx := hrana.WithBudget(ctx, budget)
+	var cancel context.CancelFunc
+	if d.timeout > 0 {
+		opCtx, cancel = context.WithTimeout(opCtx, d.timeout)
+	}
+	return &operation{ctx: opCtx, budget: budget, cancel: cancel}, nil
 }
 
 // checkQuery allows a structured read and refuses text/native SQL and joins
@@ -241,13 +344,6 @@ func (d *database) checkQuery(query dal.Query) error {
 	return nil
 }
 
-func (d *database) withBudget(ctx context.Context) context.Context {
-	if hrana.BudgetFrom(ctx) != nil {
-		return ctx
-	}
-	return hrana.WithBudget(ctx, hrana.NewBudget(d.limits))
-}
-
 func (d *database) validateRecordset(ctx context.Context, name string) error {
 	key, declared := d.declared[name]
 	if !declared {
@@ -260,8 +356,14 @@ func (d *database) validateRecordset(ctx context.Context, name string) error {
 		return nil
 	}
 	ref := dal.NewRootCollectionRef(name, "")
-	def, err := d.reader.DescribeCollection(d.withBudget(ctx), &ref)
+	def, err := d.reader.DescribeCollection(ctx, &ref)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		if safe := sanitizeReadError(err); safe != ErrBackend {
+			return safe
+		}
 		return fmt.Errorf("%w: cannot validate the declared key of %q against the live schema", ErrInvalidConfig, name)
 	}
 	if len(def.PrimaryKey) != 1 || string(def.PrimaryKey[0]) != key {
@@ -302,40 +404,50 @@ func (d *database) validateDeclaredRecordsets(ctx context.Context) error {
 }
 
 // schemaReader methods are the five borrowed dbschema.SchemaReader methods,
-// each run under the operation's shared budget.
+// each run in the operation's shared deadline and budget.
 func (d *database) ListCollections(ctx context.Context, parent *dalrecord.Key) ([]dal.CollectionRef, error) {
-	if err := d.ready(ctx, nil); err != nil {
+	op, err := d.begin(ctx)
+	if err != nil {
 		return nil, err
 	}
-	return d.reader.ListCollections(d.withBudget(ctx), parent)
+	defer op.done()
+	return d.reader.ListCollections(op.ctx, parent)
 }
 
 func (d *database) DescribeCollection(ctx context.Context, ref *dal.CollectionRef) (*dbschema.CollectionDef, error) {
-	if err := d.ready(ctx, nil); err != nil {
+	op, err := d.begin(ctx)
+	if err != nil {
 		return nil, err
 	}
-	return d.reader.DescribeCollection(d.withBudget(ctx), ref)
+	defer op.done()
+	return d.reader.DescribeCollection(op.ctx, ref)
 }
 
 func (d *database) ListIndexes(ctx context.Context, ref *dal.CollectionRef) ([]dbschema.IndexDef, error) {
-	if err := d.ready(ctx, nil); err != nil {
+	op, err := d.begin(ctx)
+	if err != nil {
 		return nil, err
 	}
-	return d.reader.ListIndexes(d.withBudget(ctx), ref)
+	defer op.done()
+	return d.reader.ListIndexes(op.ctx, ref)
 }
 
 func (d *database) ListConstraints(ctx context.Context, ref *dal.CollectionRef) ([]dbschema.ConstraintDef, error) {
-	if err := d.ready(ctx, nil); err != nil {
+	op, err := d.begin(ctx)
+	if err != nil {
 		return nil, err
 	}
-	return d.reader.ListConstraints(d.withBudget(ctx), ref)
+	defer op.done()
+	return d.reader.ListConstraints(op.ctx, ref)
 }
 
 func (d *database) ListReferrers(ctx context.Context, ref *dal.CollectionRef) ([]dbschema.Referrer, error) {
-	if err := d.ready(ctx, nil); err != nil {
+	op, err := d.begin(ctx)
+	if err != nil {
 		return nil, err
 	}
-	return d.reader.ListReferrers(d.withBudget(ctx), ref)
+	defer op.done()
+	return d.reader.ListReferrers(op.ctx, ref)
 }
 
 // ErrBackend reports a read that failed for a reason this adapter does not
@@ -343,9 +455,10 @@ func (d *database) ListReferrers(ctx context.Context, ref *dal.CollectionRef) ([
 // detail.
 var ErrBackend = errors.New("dalgo2libsql: the read failed")
 
-// sanitizeReadError keeps context identity and known DALgo sentinels, and
-// replaces anything else with ErrBackend so a server message, SQL text or a
-// transport detail never reaches the caller.
+// sanitizeReadError keeps context identity and the adapter's own classified
+// errors, and replaces anything else with ErrBackend so a server message, SQL
+// text, a column of a broken stream or a transport detail never reaches the
+// caller.
 func sanitizeReadError(err error) error {
 	if err == nil {
 		return nil
@@ -361,7 +474,10 @@ func sanitizeReadError(err error) error {
 		return err
 	case errors.Is(err, ErrInvalidConfig), errors.Is(err, ErrUnsafeTarget), errors.Is(err, ErrUnsupportedResponse):
 		return err
-	default:
-		return ErrBackend
 	}
+	var protocolErr *hrana.Error
+	if errors.As(err, &protocolErr) {
+		return protocolErr
+	}
+	return ErrBackend
 }

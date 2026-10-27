@@ -85,7 +85,9 @@ type Config struct {
 	// per-connection SQLite settings consistent.
 	MaxOpenConns int
 
-	// Timeout bounds one HTTP request. Default 30s.
+	// Timeout bounds one HTTP request and, as one operation deadline, the
+	// whole public call: every internal catalog probe, header refresh and data
+	// statement of one Get or reader shares it. Default 30s.
 	Timeout time.Duration
 
 	// MaxRequestBytes bounds one encoded request body. Default 1 MiB.
@@ -195,6 +197,17 @@ func NewDB(ctx context.Context, cfg Config) (dal.DB, error) {
 		return nil, fmt.Errorf("%w: schema reader: %s", ErrInvalidConfig, err)
 	}
 
+	// KNOWN GAP in this checkpoint: dalgo2sql v0.30.5 builds recordset
+	// columns from driver.RowsColumnTypeScanType, so a column's declared
+	// affinity decides the Go type a recordset row accepts. SQLite stores any
+	// storage class in any column, and the delegate then either refuses the
+	// row (TEXT in an INTEGER-declared column) or coerces it (a blob in a
+	// TEXT-declared column becomes a string). The driver itself never coerces
+	// (see TestDriverPreservesMixedStorageClasses), and records preserve every
+	// class except a blob in a non-BLOB-declared column or NUMERIC text. A
+	// storage-preserving delegate needs an additive dalgo2sql option (see the
+	// handoff note in README.md); until it exists this adapter does not claim
+	// mixed storage classes through records and recordsets.
 	delegate := dalgo2sql.NewDatabase(pool, dal.NewSchema(nil, nil), dalgo2sql.DbOptions{
 		ID:                     cfg.ID,
 		Recordsets:             recordsets,
@@ -214,6 +227,7 @@ func NewDB(ctx context.Context, cfg Config) (dal.DB, error) {
 		pool:                 pool,
 		client:               client,
 		limits:               limits,
+		timeout:              timeout,
 		declared:             declared,
 		recordsets:           recordsets,
 	}), nil
@@ -341,13 +355,4 @@ func isLoopbackHost(host string) bool {
 		return ip.IsLoopback()
 	}
 	return false
-}
-
-// Ping is a documented explicit connection test for a caller that holds the
-// concrete value. NewDB itself performs no I/O. It is a method on the private
-// backend, not part of dal.DB, so it cannot be reached through the sealed
-// handle; a schema read is the supported probe.
-func (d *database) ping(ctx context.Context) error {
-	budget := hrana.NewBudget(d.limits)
-	return d.pool.PingContext(hrana.WithBudget(ctx, budget))
 }

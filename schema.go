@@ -2,6 +2,7 @@ package dalgo2libsql
 
 import (
 	"context"
+	"time"
 
 	"github.com/dal-go/dalgo/dal"
 	"github.com/dal-go/dalgo/dbschema"
@@ -21,29 +22,47 @@ type schemaReader struct {
 
 var _ dbschema.SchemaReader = (*schemaReader)(nil)
 
-func (r *schemaReader) ctx(ctx context.Context) context.Context {
+// scope returns an operation-scoped context. A context that already carries
+// the operation's budget is used as it is, so a probe made during a keyed read
+// or inside a reader shares that operation's deadline and counters. A direct
+// call gets its own deadline and budget, cancelled when the call returns.
+func (r *schemaReader) scope(ctx context.Context) (context.Context, context.CancelFunc) {
 	if hrana.BudgetFrom(ctx) != nil {
-		return ctx
+		return ctx, func() {}
 	}
-	return hrana.WithBudget(ctx, hrana.NewBudget(r.limits))
+	scoped := hrana.WithBudget(ctx, hrana.NewBudget(r.limits))
+	if r.limits.Timeout <= 0 {
+		return scoped, func() {}
+	}
+	return context.WithTimeout(scoped, time.Duration(r.limits.Timeout))
 }
 
 func (r *schemaReader) ListCollections(ctx context.Context, parent *dalrecord.Key) ([]dal.CollectionRef, error) {
-	return r.reader.ListCollections(r.ctx(ctx), parent)
+	scoped, cancel := r.scope(ctx)
+	defer cancel()
+	return r.reader.ListCollections(scoped, parent)
 }
 
 func (r *schemaReader) DescribeCollection(ctx context.Context, ref *dal.CollectionRef) (*dbschema.CollectionDef, error) {
-	return r.reader.DescribeCollection(r.ctx(ctx), ref)
+	scoped, cancel := r.scope(ctx)
+	defer cancel()
+	return r.reader.DescribeCollection(scoped, ref)
 }
 
 func (r *schemaReader) ListIndexes(ctx context.Context, ref *dal.CollectionRef) ([]dbschema.IndexDef, error) {
-	return r.reader.ListIndexes(r.ctx(ctx), ref)
+	scoped, cancel := r.scope(ctx)
+	defer cancel()
+	return r.reader.ListIndexes(scoped, ref)
 }
 
 func (r *schemaReader) ListConstraints(ctx context.Context, ref *dal.CollectionRef) ([]dbschema.ConstraintDef, error) {
-	return r.reader.ListConstraints(r.ctx(ctx), ref)
+	scoped, cancel := r.scope(ctx)
+	defer cancel()
+	return r.reader.ListConstraints(scoped, ref)
 }
 
 func (r *schemaReader) ListReferrers(ctx context.Context, ref *dal.CollectionRef) ([]dbschema.Referrer, error) {
-	return r.reader.ListReferrers(r.ctx(ctx), ref)
+	scoped, cancel := r.scope(ctx)
+	defer cancel()
+	return r.reader.ListReferrers(scoped, ref)
 }

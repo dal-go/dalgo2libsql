@@ -20,6 +20,7 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -154,7 +155,7 @@ func NormalizeLimits(l Limits) (Limits, error) {
 	boundInt("MaxArgs", &l.MaxArgs, DefaultMaxArgs, AbsoluteMaxArgs)
 	boundInt("MaxStatementBytes", &l.MaxStatementBytes, DefaultMaxStatementBytes, AbsoluteMaxStatementBytes)
 	if l.Timeout < 0 {
-		errs = append(errs, errors.New("Timeout must not be negative"))
+		errs = append(errs, errors.New("timeout must not be negative"))
 	}
 	if len(errs) > 0 {
 		return Limits{}, fmt.Errorf("hrana: invalid limits: %w", errors.Join(errs...))
@@ -234,8 +235,9 @@ func (b *Budget) AddResponse(bytes int64, rows int) error {
 }
 
 // HeaderProvider returns headers for one request. It is called with the
-// operation's context, before a per-request deadline is applied, so a token
-// refresh is not cut short by the transport timeout.
+// request context, which carries the operation's deadline and the
+// per-request cap, so a provider that honours its context cannot outlive the
+// operation.
 type HeaderProvider func(ctx context.Context) (map[string]string, error)
 
 // Client is one bounded Hrana 3 pipeline endpoint.
@@ -380,7 +382,7 @@ func (c *Client) Execute(ctx context.Context, statement string, args []any) (*Re
 	if len(args) > c.limits.MaxArgs {
 		return nil, fmt.Errorf("%w: more than %d bound arguments", ErrLimit, c.limits.MaxArgs)
 	}
-	encodedArgs := make([]arg, len(args))
+	encodedArgs := make([]wireValue, len(args))
 	for i, a := range args {
 		v, err := encodeArg(a, c.limits.MaxValueBytes)
 		if err != nil {
@@ -412,23 +414,34 @@ func (c *Client) Execute(ctx context.Context, statement string, args []any) (*Re
 		return nil, err
 	}
 
-	headers := http.Header{"Content-Type": {"application/json"}, "Accept": {"application/json"}}
-	if c.headers != nil {
-		extra, err := c.headers(ctx)
-		if err != nil {
-			return nil, &Error{Op: "headers", Detail: "the header provider failed"}
-		}
-		if err := mergeHeaders(headers, extra); err != nil {
-			return nil, err
-		}
-	}
-
+	// The request context carries the caller's operation deadline and, when
+	// configured, the per-request cap. The header provider is called with it,
+	// so a provider that honours its context cannot outlive the request, while
+	// the operation's own deadline and budget survive the nested timeout.
 	reqCtx := ctx
 	var cancel context.CancelFunc
 	if c.limits.Timeout > 0 {
 		reqCtx, cancel = context.WithTimeout(ctx, time.Duration(c.limits.Timeout))
 		defer cancel()
 	}
+	if err := reqCtx.Err(); err != nil {
+		return nil, err
+	}
+
+	headers := http.Header{"Content-Type": {"application/json"}, "Accept": {"application/json"}}
+	if c.headers != nil {
+		extra, err := c.headers(reqCtx)
+		if err != nil {
+			return nil, headerError(reqCtx, err)
+		}
+		if err := mergeHeaders(headers, extra); err != nil {
+			return nil, err
+		}
+	}
+	if err := reqCtx.Err(); err != nil {
+		return nil, err
+	}
+
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, c.pipeline, bytes.NewReader(body))
 	if err != nil {
 		return nil, &Error{Op: "request", Detail: "cannot construct the request"}
@@ -437,14 +450,8 @@ func (c *Client) Execute(ctx context.Context, statement string, args []any) (*Re
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
+		if ctxErr := reqCtx.Err(); ctxErr != nil {
 			return nil, ctxErr
-		}
-		if errors.Is(err, context.DeadlineExceeded) {
-			return nil, context.DeadlineExceeded
-		}
-		if errors.Is(err, context.Canceled) {
-			return nil, context.Canceled
 		}
 		return nil, &Error{Op: "transport", Detail: "the request failed"}
 	}
@@ -459,9 +466,12 @@ func (c *Client) Execute(ctx context.Context, statement string, args []any) (*Re
 
 	raw, err := readBounded(resp.Body, c.limits.MaxResponseBytes)
 	if err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
+		if ctxErr := reqCtx.Err(); ctxErr != nil {
 			return nil, ctxErr
 		}
+		return nil, err
+	}
+	if err := reqCtx.Err(); err != nil {
 		return nil, err
 	}
 
@@ -487,45 +497,31 @@ func (c *Client) Execute(ctx context.Context, statement string, args []any) (*Re
 		return nil, err
 	}
 
-	result := decoded.Results[0].Response.Result
-	out := &Result{Columns: make([]Column, len(result.Cols)), Rows: make([][]Value, len(result.Rows))}
-	if len(result.Cols) > c.limits.MaxColumns {
-		return nil, fmt.Errorf("%w: more than %d columns", ErrLimit, c.limits.MaxColumns)
+	out, err := decodeExecuteResult(decoded.Results[0].Response.Result, c.limits)
+	if err != nil {
+		return nil, err
 	}
-	if len(result.Rows) > c.limits.MaxRows {
-		return nil, fmt.Errorf("%w: more than %d rows", ErrLimit, c.limits.MaxRows)
-	}
-	for i, col := range result.Cols {
-		if col.Name == "" || !utf8.ValidString(col.Name) || len(col.Name) > 1024 {
-			return nil, &Error{Op: "decode", Detail: "a column name is empty or invalid"}
-		}
-		if len(col.DeclType) > 255 || !utf8.ValidString(col.DeclType) {
-			return nil, &Error{Op: "decode", Detail: "a declared type is invalid"}
-		}
-		out.Columns[i] = Column{Name: col.Name, DeclType: col.DeclType}
-	}
-	for r, row := range result.Rows {
-		if len(row) != len(result.Cols) {
-			return nil, &Error{Op: "decode", Detail: "a row does not match the column count"}
-		}
-		cells := make([]Value, len(row))
-		for i, cell := range row {
-			v, err := cell.decode(c.limits.MaxValueBytes)
-			if err != nil {
-				return nil, err
-			}
-			cells[i] = v
-		}
-		out.Rows[r] = cells
-	}
-	if result.AffectedRowCount < 0 {
-		return nil, &Error{Op: "decode", Detail: "a negative affected row count"}
-	}
-	out.Affected = result.AffectedRowCount
 	if err := budget.AddResponse(int64(len(raw)), len(out.Rows)); err != nil {
 		return nil, err
 	}
 	return out, nil
+}
+
+// headerError turns a header-provider failure into a safe error. A provider
+// that returns the context's error keeps that identity, so a caller can tell a
+// cancellation from a token problem; any other cause is replaced, never
+// echoed, because it can carry a token or a URL.
+func headerError(ctx context.Context, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	if errors.Is(err, context.Canceled) {
+		return context.Canceled
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return context.DeadlineExceeded
+	}
+	return &Error{Op: "headers", Detail: "the header provider failed"}
 }
 
 func sameOriginAndPath(raw string, configured *url.URL) bool {
@@ -575,93 +571,137 @@ func readBounded(r io.Reader, max int64) ([]byte, error) {
 	return raw, nil
 }
 
-type arg struct {
-	Type  string `json:"type"`
-	Value string `json:"value"`
+// --- Values ---------------------------------------------------------------
+//
+// HRANA_3_SPEC.md defines the JSON Value structure as:
+//
+//	{ "type": "null" }
+//	{ "type": "integer", "value": string }
+//	{ "type": "float",   "value": number }
+//	{ "type": "text",    "value": string }
+//	{ "type": "blob",    "base64": string }
+//
+// An integer is a decimal string to keep full int64 precision, a float is a
+// JSON number, and a blob lives in "base64", never in "value". Encoding or
+// decoding any other shape is a protocol violation, not a lossy conversion.
+
+// wireValue is one encoded argument. A blob is carried in Base64 and never in
+// Value; a float is a JSON number; an integer and text are JSON strings.
+type wireValue struct {
+	Type   string  `json:"type"`
+	Value  any     `json:"value,omitempty"`
+	Base64 *string `json:"base64,omitempty"`
 }
 
-func encodeArg(v any, maxValue int) (arg, error) {
+func encodeArg(v any, maxValue int) (wireValue, error) {
 	switch x := v.(type) {
 	case nil:
-		return arg{Type: "null"}, nil
+		return wireValue{Type: "null"}, nil
 	case int:
-		return arg{Type: "integer", Value: fmt.Sprintf("%d", int64(x))}, nil
+		return wireValue{Type: "integer", Value: strconv.FormatInt(int64(x), 10)}, nil
 	case int64:
-		return arg{Type: "integer", Value: fmt.Sprintf("%d", x)}, nil
+		return wireValue{Type: "integer", Value: strconv.FormatInt(x, 10)}, nil
 	case bool:
 		if x {
-			return arg{Type: "integer", Value: "1"}, nil
+			return wireValue{Type: "integer", Value: "1"}, nil
 		}
-		return arg{Type: "integer", Value: "0"}, nil
+		return wireValue{Type: "integer", Value: "0"}, nil
 	case float64:
 		if math.IsNaN(x) || math.IsInf(x, 0) {
-			return arg{}, &Error{Op: "encode", Detail: "a bound float is not finite"}
+			return wireValue{}, &Error{Op: "encode", Detail: "a bound float is not finite"}
 		}
-		return arg{Type: "float", Value: fmt.Sprintf("%v", x)}, nil
+		return wireValue{Type: "float", Value: x}, nil
 	case string:
 		if len(x) > maxValue {
-			return arg{}, fmt.Errorf("%w: a bound text value exceeds %d bytes", ErrLimit, maxValue)
+			return wireValue{}, fmt.Errorf("%w: a bound text value exceeds %d bytes", ErrLimit, maxValue)
 		}
-		return arg{Type: "text", Value: x}, nil
+		return wireValue{Type: "text", Value: x}, nil
 	case []byte:
 		if len(x) > maxValue {
-			return arg{}, fmt.Errorf("%w: a bound blob value exceeds %d bytes", ErrLimit, maxValue)
+			return wireValue{}, fmt.Errorf("%w: a bound blob value exceeds %d bytes", ErrLimit, maxValue)
 		}
-		return arg{Type: "blob", Value: base64.StdEncoding.EncodeToString(x)}, nil
+		encoded := base64.StdEncoding.EncodeToString(x)
+		return wireValue{Type: "blob", Base64: &encoded}, nil
 	default:
-		return arg{}, &Error{Op: "encode", Detail: "a bound argument type is not supported"}
+		return wireValue{}, &Error{Op: "encode", Detail: "a bound argument type is not supported"}
 	}
 }
 
+// cell is one raw JSON cell. Value and Base64 are kept raw so an absent field
+// is distinguishable from null, a string from a number, and a cross-tagged
+// field is refused instead of silently ignored.
+type cell struct {
+	Type   string          `json:"type"`
+	Value  json.RawMessage `json:"value"`
+	Base64 json.RawMessage `json:"base64"`
+}
+
 func (c cell) decode(maxValue int) (Value, error) {
+	hasValue := len(bytes.TrimSpace(c.Value)) > 0
+	hasBase64 := len(bytes.TrimSpace(c.Base64)) > 0
 	switch c.Type {
 	case "null":
-		if c.Value != nil && *c.Value != "" {
+		if hasValue || hasBase64 {
 			return Value{}, &Error{Op: "decode", Detail: "a null cell carries a value"}
 		}
 		return Value{Kind: Null}, nil
 	case "integer":
-		if c.Value == nil {
-			return Value{}, &Error{Op: "decode", Detail: "an integer cell has no value"}
+		if !hasValue || hasBase64 {
+			return Value{}, &Error{Op: "decode", Detail: "an integer cell must carry only a string value"}
 		}
-		var n int64
-		if err := json.Unmarshal([]byte(*c.Value), &n); err != nil {
+		s, err := jsonString(c.Value, "an integer cell")
+		if err != nil {
+			return Value{}, err
+		}
+		n, err := strconv.ParseInt(s, 10, 64)
+		if err != nil {
 			return Value{}, &Error{Op: "decode", Detail: "an integer cell is malformed or out of range"}
 		}
 		return Value{Kind: Integer, Int: n}, nil
 	case "float":
-		if c.Value == nil {
-			return Value{}, &Error{Op: "decode", Detail: "a float cell has no value"}
+		if !hasValue || hasBase64 {
+			return Value{}, &Error{Op: "decode", Detail: "a float cell must carry only a numeric value"}
 		}
-		var f float64
-		if err := json.Unmarshal([]byte(*c.Value), &f); err != nil {
-			return Value{}, &Error{Op: "decode", Detail: "a float cell is malformed"}
+		f, err := jsonFloat(c.Value, "a float cell")
+		if err != nil {
+			return Value{}, err
 		}
 		if math.IsNaN(f) || math.IsInf(f, 0) {
 			return Value{}, &Error{Op: "decode", Detail: "a float cell is not finite"}
 		}
 		return Value{Kind: Float, Float: f}, nil
 	case "text":
-		if c.Value == nil {
-			return Value{}, &Error{Op: "decode", Detail: "a text cell has no value"}
+		if !hasValue || hasBase64 {
+			return Value{}, &Error{Op: "decode", Detail: "a text cell must carry only a string value"}
 		}
-		if len(*c.Value) > maxValue {
+		s, err := jsonString(c.Value, "a text cell")
+		if err != nil {
+			return Value{}, err
+		}
+		if len(s) > maxValue {
 			return Value{}, fmt.Errorf("%w: a text cell exceeds %d bytes", ErrLimit, maxValue)
 		}
-		if !utf8.ValidString(*c.Value) {
+		if !utf8.ValidString(s) {
 			return Value{}, &Error{Op: "decode", Detail: "a text cell is not valid UTF-8"}
 		}
-		return Value{Kind: Text, Text: *c.Value}, nil
+		return Value{Kind: Text, Text: s}, nil
 	case "blob":
-		if c.Value == nil {
-			return Value{}, &Error{Op: "decode", Detail: "a blob cell has no value"}
+		if hasValue || !hasBase64 {
+			return Value{}, &Error{Op: "decode", Detail: "a blob cell must carry only a base64 field"}
 		}
-		if base64.StdEncoding.DecodedLen(len(*c.Value)) > maxValue {
+		s, err := jsonString(c.Base64, "a blob cell")
+		if err != nil {
+			return Value{}, err
+		}
+		if base64.StdEncoding.DecodedLen(len(s)) > maxValue {
 			return Value{}, fmt.Errorf("%w: a blob cell exceeds %d bytes", ErrLimit, maxValue)
 		}
-		raw, err := base64.StdEncoding.DecodeString(*c.Value)
+		raw, err := base64.StdEncoding.DecodeString(s)
 		if err != nil {
 			return Value{}, &Error{Op: "decode", Detail: "a blob cell is not valid base64"}
+		}
+		if len(raw) > maxValue {
+			return Value{}, fmt.Errorf("%w: a blob cell exceeds %d bytes", ErrLimit, maxValue)
 		}
 		return Value{Kind: Blob, Blob: raw}, nil
 	default:
@@ -669,7 +709,199 @@ func (c cell) decode(maxValue int) (Value, error) {
 	}
 }
 
-// The wire types below follow HRANA_3_SPEC.md.
+func jsonString(raw json.RawMessage, what string) (string, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '"' {
+		return "", &Error{Op: "decode", Detail: what + " must be a JSON string"}
+	}
+	var s string
+	if err := json.Unmarshal(trimmed, &s); err != nil {
+		return "", &Error{Op: "decode", Detail: what + " must be a JSON string"}
+	}
+	return s, nil
+}
+
+func jsonFloat(raw json.RawMessage, what string) (float64, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] == '"' || trimmed[0] == '{' || trimmed[0] == '[' ||
+		trimmed[0] == 't' || trimmed[0] == 'f' || bytes.Equal(trimmed, []byte("null")) {
+		return 0, &Error{Op: "decode", Detail: what + " must be a JSON number"}
+	}
+	var f float64
+	if err := json.Unmarshal(trimmed, &f); err != nil {
+		return 0, &Error{Op: "decode", Detail: what + " must be a finite JSON number"}
+	}
+	return f, nil
+}
+
+func jsonUint(raw json.RawMessage, name string) (uint64, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return 0, &Error{Op: "decode", Detail: name + " is missing"}
+	}
+	if trimmed[0] == '"' || trimmed[0] == '-' || trimmed[0] == '{' || trimmed[0] == '[' ||
+		trimmed[0] == 't' || trimmed[0] == 'f' || bytes.Equal(trimmed, []byte("null")) {
+		return 0, &Error{Op: "decode", Detail: name + " must be a non-negative JSON integer"}
+	}
+	var n uint64
+	if err := json.Unmarshal(trimmed, &n); err != nil {
+		return 0, &Error{Op: "decode", Detail: name + " must be a non-negative JSON integer"}
+	}
+	return n, nil
+}
+
+// --- Results --------------------------------------------------------------
+
+// decodeExecuteResult validates every mandatory field of a StmtResult before
+// any value is returned. An absent or null field, a wrong JSON type, or a row
+// whose width does not match the columns is an error, never a successful zero
+// result. Unknown fields are ignored, as the protocol requires.
+func decodeExecuteResult(wire *executeResult, limits Limits) (*Result, error) {
+	if wire == nil {
+		return nil, &Error{Op: "decode", Detail: "the execute result is missing"}
+	}
+	columns, err := decodeColumns(wire.Cols, limits.MaxColumns)
+	if err != nil {
+		return nil, err
+	}
+	if len(columns) > limits.MaxColumns {
+		return nil, fmt.Errorf("%w: more than %d columns", ErrLimit, limits.MaxColumns)
+	}
+	rows, err := decodeRows(wire.Rows, len(columns), limits)
+	if err != nil {
+		return nil, err
+	}
+	affected, err := jsonUint(wire.AffectedRowCount, "affected_row_count")
+	if err != nil {
+		return nil, err
+	}
+	if affected > math.MaxInt64 {
+		return nil, &Error{Op: "decode", Detail: "affected_row_count is out of range"}
+	}
+	if err := decodeLastInsertRowID(wire.LastInsertRowID); err != nil {
+		return nil, err
+	}
+	if _, err := jsonUint(wire.RowsRead, "rows_read"); err != nil {
+		return nil, err
+	}
+	if _, err := jsonUint(wire.RowsWritten, "rows_written"); err != nil {
+		return nil, err
+	}
+	if _, err := jsonFloat(wire.QueryDurationMS, "query_duration_ms"); err != nil {
+		return nil, err
+	}
+	return &Result{Columns: columns, Rows: rows, Affected: int64(affected)}, nil
+}
+
+func decodeColumns(raw json.RawMessage, max int) ([]Column, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return nil, &Error{Op: "decode", Detail: "cols is missing"}
+	}
+	if trimmed[0] != '[' {
+		return nil, &Error{Op: "decode", Detail: "cols must be an array"}
+	}
+	var entries []wireColumn
+	if err := json.Unmarshal(trimmed, &entries); err != nil {
+		return nil, &Error{Op: "decode", Detail: "cols is malformed"}
+	}
+	if len(entries) > max {
+		return nil, fmt.Errorf("%w: more than %d columns", ErrLimit, max)
+	}
+	out := make([]Column, len(entries))
+	for i, entry := range entries {
+		name, err := jsonNullableString(entry.Name, "a column name")
+		if err != nil {
+			return nil, err
+		}
+		if len(name) > 1024 || !utf8.ValidString(name) {
+			return nil, &Error{Op: "decode", Detail: "a column name is invalid"}
+		}
+		declType, err := jsonNullableString(entry.DeclType, "a declared type")
+		if err != nil {
+			return nil, err
+		}
+		if len(declType) > 255 || !utf8.ValidString(declType) {
+			return nil, &Error{Op: "decode", Detail: "a declared type is invalid"}
+		}
+		out[i] = Column{Name: name, DeclType: declType}
+	}
+	return out, nil
+}
+
+func jsonNullableString(raw json.RawMessage, what string) (string, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return "", &Error{Op: "decode", Detail: what + " is missing"}
+	}
+	if bytes.Equal(trimmed, []byte("null")) {
+		return "", nil
+	}
+	return jsonString(trimmed, what)
+}
+
+func decodeRows(raw json.RawMessage, columns int, limits Limits) ([][]Value, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return nil, &Error{Op: "decode", Detail: "rows is missing"}
+	}
+	if trimmed[0] != '[' {
+		return nil, &Error{Op: "decode", Detail: "rows must be an array"}
+	}
+	var entries []json.RawMessage
+	if err := json.Unmarshal(trimmed, &entries); err != nil {
+		return nil, &Error{Op: "decode", Detail: "rows is malformed"}
+	}
+	if len(entries) > limits.MaxRows {
+		return nil, fmt.Errorf("%w: more than %d rows", ErrLimit, limits.MaxRows)
+	}
+	out := make([][]Value, len(entries))
+	for r, entry := range entries {
+		body := bytes.TrimSpace(entry)
+		if len(body) == 0 || body[0] != '[' {
+			return nil, &Error{Op: "decode", Detail: "a row must be an array"}
+		}
+		var cells []cell
+		if err := json.Unmarshal(body, &cells); err != nil {
+			return nil, &Error{Op: "decode", Detail: "a row is malformed"}
+		}
+		if len(cells) != columns {
+			return nil, &Error{Op: "decode", Detail: "a row does not match the column count"}
+		}
+		values := make([]Value, len(cells))
+		for i, c := range cells {
+			v, err := c.decode(limits.MaxValueBytes)
+			if err != nil {
+				return nil, err
+			}
+			values[i] = v
+		}
+		out[r] = values
+	}
+	return out, nil
+}
+
+// decodeLastInsertRowID validates the mandatory last_insert_rowid field: it
+// must be present, and either null or a decimal string holding a signed int64.
+func decodeLastInsertRowID(raw json.RawMessage) error {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return &Error{Op: "decode", Detail: "last_insert_rowid is missing"}
+	}
+	if bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	s, err := jsonString(trimmed, "last_insert_rowid")
+	if err != nil {
+		return err
+	}
+	if _, err := strconv.ParseInt(s, 10, 64); err != nil {
+		return &Error{Op: "decode", Detail: "last_insert_rowid is not a signed 64-bit string"}
+	}
+	return nil
+}
+
+// --- Wire structures ------------------------------------------------------
 
 type pipelineRequest struct {
 	Baton    *string   `json:"baton"`
@@ -682,9 +914,9 @@ type request struct {
 }
 
 type stmt struct {
-	SQL      string `json:"sql"`
-	Args     []arg  `json:"args"`
-	WantRows bool   `json:"want_rows"`
+	SQL      string      `json:"sql"`
+	Args     []wireValue `json:"args"`
+	WantRows bool        `json:"want_rows"`
 }
 
 type pipelineResponse struct {
@@ -700,14 +932,30 @@ type resultOrError struct {
 }
 
 func (r resultOrError) validate(want string) error {
-	if r.Type == "error" {
+	switch r.Type {
+	case "error":
+		if r.Response != nil {
+			return &Error{Op: "decode", Detail: "an error result also carries a response"}
+		}
+		if r.Error == nil {
+			return &Error{Op: "decode", Detail: "an error result carries no error"}
+		}
+		if r.Error.Message == nil {
+			return &Error{Op: "decode", Detail: "a server error carries no message"}
+		}
 		code := ""
-		if r.Error != nil {
-			code = r.Error.Code
+		if r.Error.Code != nil {
+			code = safeServerCode(*r.Error.Code)
 		}
 		return &Error{Op: "server", Code: code, Detail: "the endpoint reported an error for the " + want + " request"}
-	}
-	if r.Type != "ok" || r.Response == nil {
+	case "ok":
+		if r.Error != nil {
+			return &Error{Op: "decode", Detail: "an ok result also carries an error"}
+		}
+		if r.Response == nil {
+			return &Error{Op: "decode", Detail: "an ok result carries no response"}
+		}
+	default:
 		return &Error{Op: "decode", Detail: "a result is neither ok nor an error"}
 	}
 	if want == "execute" {
@@ -725,9 +973,35 @@ func (r resultOrError) validate(want string) error {
 	return nil
 }
 
+// safeServerCode returns code only when it is one of the stable libSQL/SQLite
+// codes this adapter knows. An arbitrary code is server text: it can carry a
+// token, a query or a path, so it is omitted rather than echoed.
+func safeServerCode(code string) string {
+	if _, ok := allowedServerCodes[code]; ok {
+		return code
+	}
+	return ""
+}
+
+var allowedServerCodes = map[string]struct{}{
+	"SQLITE_OK": {}, "SQLITE_ERROR": {}, "SQLITE_INTERNAL": {}, "SQLITE_PERM": {},
+	"SQLITE_ABORT": {}, "SQLITE_BUSY": {}, "SQLITE_LOCKED": {}, "SQLITE_NOMEM": {},
+	"SQLITE_READONLY": {}, "SQLITE_INTERRUPT": {}, "SQLITE_IOERR": {}, "SQLITE_CORRUPT": {},
+	"SQLITE_NOTFOUND": {}, "SQLITE_FULL": {}, "SQLITE_CANTOPEN": {}, "SQLITE_PROTOCOL": {},
+	"SQLITE_EMPTY": {}, "SQLITE_SCHEMA": {}, "SQLITE_TOOBIG": {}, "SQLITE_CONSTRAINT": {},
+	"SQLITE_MISMATCH": {}, "SQLITE_MISUSE": {}, "SQLITE_NOLFS": {}, "SQLITE_AUTH": {},
+	"SQLITE_FORMAT": {}, "SQLITE_RANGE": {}, "SQLITE_NOTADB": {}, "SQLITE_NOTICE": {},
+	"SQLITE_WARNING": {}, "SQLITE_ROW": {}, "SQLITE_DONE": {},
+	"SQLITE_CONSTRAINT_PRIMARYKEY": {}, "SQLITE_CONSTRAINT_UNIQUE": {},
+	"SQLITE_CONSTRAINT_NOTNULL": {}, "SQLITE_CONSTRAINT_FOREIGNKEY": {},
+	"SQLITE_CONSTRAINT_CHECK": {},
+	"HRANA_PROTO_ERROR":       {}, "HRANA_CLOSED": {}, "HRANA_SYNC_TIMEOUT": {},
+	"HRANA_SYNC_INTERRUPTED": {}, "HRANA_SYNC_ABORTED": {},
+}
+
 type wireError struct {
-	Message string `json:"message"`
-	Code    string `json:"code"`
+	Message *string `json:"message"`
+	Code    *string `json:"code"`
 }
 
 type response struct {
@@ -736,18 +1010,16 @@ type response struct {
 }
 
 type executeResult struct {
-	Cols             []wireColumn `json:"cols"`
-	Rows             [][]cell     `json:"rows"`
-	AffectedRowCount int64        `json:"affected_row_count"`
-	LastInsertRowID  *string      `json:"last_insert_rowid"`
+	Cols             json.RawMessage `json:"cols"`
+	Rows             json.RawMessage `json:"rows"`
+	AffectedRowCount json.RawMessage `json:"affected_row_count"`
+	LastInsertRowID  json.RawMessage `json:"last_insert_rowid"`
+	RowsRead         json.RawMessage `json:"rows_read"`
+	RowsWritten      json.RawMessage `json:"rows_written"`
+	QueryDurationMS  json.RawMessage `json:"query_duration_ms"`
 }
 
 type wireColumn struct {
-	Name     string `json:"name"`
-	DeclType string `json:"decltype"`
-}
-
-type cell struct {
-	Type  string  `json:"type"`
-	Value *string `json:"value"`
+	Name     json.RawMessage `json:"name"`
+	DeclType json.RawMessage `json:"decltype"`
 }

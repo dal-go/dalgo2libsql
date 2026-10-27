@@ -35,6 +35,26 @@ func newPipelineServer(t *testing.T, result map[string]any, calls *int) *httptes
 	return server
 }
 
+// driverResult builds a complete StmtResult with the mandatory Hrana 3
+// fields, so a fixture that forgets one is a test failure, not a coincidence.
+func driverResult(cols []any, rows ...[]any) map[string]any {
+	if cols == nil {
+		cols = []any{}
+	}
+	if rows == nil {
+		rows = [][]any{}
+	}
+	return map[string]any{
+		"cols":               cols,
+		"rows":               rows,
+		"affected_row_count": 0,
+		"last_insert_rowid":  nil,
+		"rows_read":          0,
+		"rows_written":       0,
+		"query_duration_ms":  0,
+	}
+}
+
 func newTestConnector(t *testing.T, serverURL string) *connector {
 	t.Helper()
 	endpoint, err := url.Parse(serverURL)
@@ -50,8 +70,8 @@ func newTestConnector(t *testing.T, serverURL string) *connector {
 }
 
 func TestSQLDriverScansTypedRows(t *testing.T) {
-	server := newPipelineServer(t, map[string]any{
-		"cols": []any{
+	server := newPipelineServer(t, driverResult(
+		[]any{
 			map[string]any{"name": "n", "decltype": "INTEGER"},
 			map[string]any{"name": "f", "decltype": "REAL"},
 			map[string]any{"name": "t", "decltype": "TEXT"},
@@ -59,18 +79,18 @@ func TestSQLDriverScansTypedRows(t *testing.T) {
 			map[string]any{"name": "z", "decltype": ""},
 			map[string]any{"name": "nullable", "decltype": "TEXT"},
 		},
-		"rows": [][]any{[]any{
+		[]any{
 			map[string]any{"type": "integer", "value": "-9223372036854775808"},
-			map[string]any{"type": "float", "value": "1.25"},
+			map[string]any{"type": "float", "value": 1.25},
 			map[string]any{"type": "text", "value": "héllo"},
-			map[string]any{"type": "blob", "value": base64.StdEncoding.EncodeToString([]byte{7, 8})},
+			map[string]any{"type": "blob", "base64": base64.StdEncoding.EncodeToString([]byte{7, 8})},
 			map[string]any{"type": "null"},
 			map[string]any{"type": "null"},
-		}},
-	}, nil)
+		},
+	), nil)
 	connector := newTestConnector(t, server.URL)
 	pool := sql.OpenDB(connector)
-	defer pool.Close()
+	defer func() { _ = pool.Close() }()
 
 	var n int64
 	var f float64
@@ -81,7 +101,7 @@ func TestSQLDriverScansTypedRows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("query: %v", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	types, err := rows.ColumnTypes()
 	if err != nil {
 		t.Fatalf("column types: %v", err)
@@ -129,10 +149,10 @@ func TestSQLDriverScansTypedRows(t *testing.T) {
 
 func TestSQLDriverRefusesUnsupportedSurfaces(t *testing.T) {
 	var calls int
-	server := newPipelineServer(t, map[string]any{"cols": []any{}, "rows": []any{}}, &calls)
+	server := newPipelineServer(t, driverResult(nil), &calls)
 	connector := newTestConnector(t, server.URL)
 	pool := sql.OpenDB(connector)
-	defer pool.Close()
+	defer func() { _ = pool.Close() }()
 	ctx := context.Background()
 
 	if _, err := pool.PrepareContext(ctx, "SELECT 1"); !errors.Is(err, ErrNotSupported) {
@@ -164,10 +184,10 @@ func TestSQLDriverRefusesUnsupportedSurfaces(t *testing.T) {
 }
 
 func TestSQLDriverRefusesNamedAndUnsupportedArguments(t *testing.T) {
-	server := newPipelineServer(t, map[string]any{"cols": []any{}, "rows": []any{}}, nil)
+	server := newPipelineServer(t, driverResult(nil), nil)
 	connector := newTestConnector(t, server.URL)
 	pool := sql.OpenDB(connector)
-	defer pool.Close()
+	defer func() { _ = pool.Close() }()
 	ctx := context.Background()
 
 	if _, err := pool.QueryContext(ctx, "SELECT ?", sql.Named("n", 1)); err == nil {
@@ -179,13 +199,12 @@ func TestSQLDriverRefusesNamedAndUnsupportedArguments(t *testing.T) {
 }
 
 func TestSQLDriverRowsCloseIsIdempotent(t *testing.T) {
-	server := newPipelineServer(t, map[string]any{
-		"cols": []any{map[string]any{"name": "n", "decltype": "INTEGER"}},
-		"rows": [][]any{},
-	}, nil)
+	server := newPipelineServer(t, driverResult(
+		[]any{map[string]any{"name": "n", "decltype": "INTEGER"}},
+	), nil)
 	connector := newTestConnector(t, server.URL)
 	pool := sql.OpenDB(connector)
-	defer pool.Close()
+	defer func() { _ = pool.Close() }()
 	rows, err := pool.QueryContext(context.Background(), "SELECT 1")
 	if err != nil {
 		t.Fatalf("query: %v", err)

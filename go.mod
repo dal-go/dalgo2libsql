@@ -7,6 +7,7 @@ require (
 	github.com/dal-go/dalgo2sql v0.30.5
 	github.com/dal-go/dalgo2sqlite v0.5.0
 	github.com/dal-go/record v0.1.5
+	modernc.org/sqlite v1.61.0
 )
 
 require (
@@ -25,5 +26,4 @@ require (
 	modernc.org/libc v1.79.0 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.12.1 // indirect
-	modernc.org/sqlite v1.61.0 // indirect
 )

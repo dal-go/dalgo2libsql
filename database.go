@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -355,35 +356,12 @@ func (d *database) validateRecordset(ctx context.Context, name string) error {
 	if already {
 		return nil
 	}
-	ref := dal.NewRootCollectionRef(name, "")
-	def, err := d.reader.DescribeCollection(ctx, &ref)
+	keyType, err := d.describeKey(ctx, name, key)
 	if err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return ctxErr
-		}
-		if safe := sanitizeReadError(err); safe != ErrBackend {
-			return safe
-		}
-		return fmt.Errorf("%w: cannot validate the declared key of %q against the live schema", ErrInvalidConfig, name)
+		return err
 	}
-	if len(def.PrimaryKey) != 1 || string(def.PrimaryKey[0]) != key {
-		return fmt.Errorf("%w: %q does not have the declared single-column primary key", ErrInvalidConfig, name)
-	}
-	var found *dbschema.FieldDef
-	for i := range def.Fields {
-		if string(def.Fields[i].Name) == key {
-			found = &def.Fields[i]
-			break
-		}
-	}
-	if found == nil {
-		return fmt.Errorf("%w: the declared key column is not described by the schema", ErrInvalidConfig)
-	}
-	if found.Nullable {
-		return fmt.Errorf("%w: the declared key column is nullable", ErrInvalidConfig)
-	}
-	if found.Type != dbschema.Int && found.Type != dbschema.String {
-		return fmt.Errorf("%w: the declared key column is neither INTEGER nor TEXT", ErrInvalidConfig)
+	if keyType == "" {
+		return fmt.Errorf("%w: %q does not expose exactly one non-nullable INTEGER or TEXT primary key named %q", ErrInvalidConfig, name, key)
 	}
 	d.validateMu.Lock()
 	if d.validated == nil {
@@ -392,6 +370,127 @@ func (d *database) validateRecordset(ctx context.Context, name string) error {
 	d.validated[name] = true
 	d.validateMu.Unlock()
 	return nil
+}
+
+// describeKey validates a declared key against the live catalog with the
+// table-valued pragma functions, which a read-only libSQL token may run:
+// a bare `PRAGMA foreign_keys` is refused with 403 by libsql-server 0.24.33.
+// It returns "int", "text", or "" when the declaration is not one non-nullable
+// single-column INTEGER/TEXT primary key. The empty result is a refusal, not
+// an error: the caller reports it as ErrInvalidConfig.
+func (d *database) describeKey(ctx context.Context, name, key string) (string, error) {
+	rows, err := d.pool.QueryContext(ctx,
+		`SELECT name, type, "notnull", pk FROM pragma_table_info(?) ORDER BY cid`, name)
+	if err != nil {
+		return "", d.catalogError(ctx, err)
+	}
+	defer func() { _ = rows.Close() }()
+	type column struct {
+		name    string
+		decl    string
+		notNull bool
+		pk      int
+	}
+	var columns []column
+	pkCount := 0
+	for rows.Next() {
+		var col column
+		var decl sql.NullString
+		var notNull, pk int
+		if err := rows.Scan(&col.name, &decl, &notNull, &pk); err != nil {
+			return "", d.catalogError(ctx, err)
+		}
+		col.decl = decl.String
+		col.notNull = notNull != 0
+		col.pk = pk
+		if pk > 0 {
+			pkCount++
+		}
+		columns = append(columns, col)
+	}
+	if err := rows.Err(); err != nil {
+		return "", d.catalogError(ctx, err)
+	}
+	if pkCount != 1 {
+		return "", nil
+	}
+	var found *column
+	for i := range columns {
+		if columns[i].pk == 1 {
+			found = &columns[i]
+			break
+		}
+	}
+	if found == nil || found.name != key {
+		return "", nil
+	}
+	kind := sqliteKeyType(found.decl)
+	if kind == "" {
+		return "", nil
+	}
+	if found.notNull {
+		return kind, nil
+	}
+	// A sole INTEGER PRIMARY KEY is a rowid alias and cannot be NULL — unless
+	// SQLite created a primary-key index for it (INTEGER PRIMARY KEY DESC, a
+	// WITHOUT ROWID table), in which case NULLs are possible.
+	if kind != "int" {
+		return "", nil
+	}
+	hasPKIndex, err := d.hasPrimaryKeyIndex(ctx, name)
+	if err != nil {
+		return "", err
+	}
+	if hasPKIndex {
+		return "", nil
+	}
+	return kind, nil
+}
+
+func (d *database) hasPrimaryKeyIndex(ctx context.Context, name string) (bool, error) {
+	rows, err := d.pool.QueryContext(ctx,
+		`SELECT origin FROM pragma_index_list(?) WHERE origin = 'pk'`, name)
+	if err != nil {
+		return false, d.catalogError(ctx, err)
+	}
+	defer func() { _ = rows.Close() }()
+	found := false
+	for rows.Next() {
+		var origin string
+		if err := rows.Scan(&origin); err != nil {
+			return false, d.catalogError(ctx, err)
+		}
+		found = true
+	}
+	if err := rows.Err(); err != nil {
+		return false, d.catalogError(ctx, err)
+	}
+	return found, nil
+}
+
+// sqliteKeyType returns the key kind of a declared SQLite type: "int" or
+// "text". Anything else, including no declared type, is not a key this adapter
+// can read by value.
+func sqliteKeyType(decl string) string {
+	upper := strings.ToUpper(strings.TrimSpace(decl))
+	switch {
+	case strings.Contains(upper, "INT"):
+		return "int"
+	case strings.Contains(upper, "CHAR"), strings.Contains(upper, "CLOB"), strings.Contains(upper, "TEXT"):
+		return "text"
+	default:
+		return ""
+	}
+}
+
+func (d *database) catalogError(ctx context.Context, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	if safe := sanitizeReadError(err); safe != ErrBackend {
+		return safe
+	}
+	return fmt.Errorf("%w: the declared key could not be validated against the live schema", ErrInvalidConfig)
 }
 
 func (d *database) validateDeclaredRecordsets(ctx context.Context) error {

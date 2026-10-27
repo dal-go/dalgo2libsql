@@ -696,7 +696,7 @@ func (c cell) decode(maxValue int) (Value, error) {
 		if base64.StdEncoding.DecodedLen(len(s)) > maxValue {
 			return Value{}, fmt.Errorf("%w: a blob cell exceeds %d bytes", ErrLimit, maxValue)
 		}
-		raw, err := base64.StdEncoding.DecodeString(s)
+		raw, err := decodeBase64(s)
 		if err != nil {
 			return Value{}, &Error{Op: "decode", Detail: "a blob cell is not valid base64"}
 		}
@@ -707,6 +707,16 @@ func (c cell) decode(maxValue int) (Value, error) {
 	default:
 		return Value{}, &Error{Op: "decode", Detail: "a cell has an unknown storage class"}
 	}
+}
+
+// decodeBase64 accepts both padded and unpadded standard base64. The libSQL
+// server emits unpadded data (one byte is "AQ", not "AQ=="), while other
+// implementations pad; the protocol does not fix either form.
+func decodeBase64(s string) ([]byte, error) {
+	if raw, err := base64.StdEncoding.DecodeString(s); err == nil {
+		return raw, nil
+	}
+	return base64.RawStdEncoding.DecodeString(s)
 }
 
 func jsonString(raw json.RawMessage, what string) (string, error) {

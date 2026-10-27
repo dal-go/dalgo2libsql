@@ -38,6 +38,8 @@ func seedSQLite(t *testing.T) *sqliteHrana {
 		`CREATE TABLE composite (a INTEGER NOT NULL, b TEXT NOT NULL, v TEXT, PRIMARY KEY (a, b))`,
 		`CREATE TABLE nullable_key (code TEXT, v TEXT)`,
 		`CREATE UNIQUE INDEX nullable_key_code ON nullable_key (code)`,
+		`CREATE TABLE pk_desc (id INTEGER PRIMARY KEY DESC, v TEXT)`,
+		`INSERT INTO pk_desc (id, v) VALUES (NULL, 'null-first'), (1, 'one')`,
 		`CREATE TABLE unique_key (code TEXT NOT NULL UNIQUE, v TEXT)`,
 		`CREATE TABLE other_items (id INTEGER PRIMARY KEY, v TEXT)`,
 		`INSERT INTO other_items (id, v) VALUES (10, 'ten')`,
@@ -141,11 +143,12 @@ func TestBackendKeyedReadsRefuseUnvalidatedKeys(t *testing.T) {
 		collection string
 		recordsets map[string]string
 	}{
-		"undeclared":      {collection: "items"},
-		"wrong key":       {collection: "items", recordsets: map[string]string{"items": "name"}},
-		"composite":       {collection: "composite", recordsets: map[string]string{"composite": "a"}},
-		"nullable key":    {collection: "nullable_key", recordsets: map[string]string{"nullable_key": "code"}},
-		"non-integer key": {collection: "items", recordsets: map[string]string{"items": "price"}},
+		"undeclared":             {collection: "items"},
+		"wrong key":              {collection: "items", recordsets: map[string]string{"items": "name"}},
+		"composite":              {collection: "composite", recordsets: map[string]string{"composite": "a"}},
+		"nullable key":           {collection: "nullable_key", recordsets: map[string]string{"nullable_key": "code"}},
+		"non-integer key":        {collection: "items", recordsets: map[string]string{"items": "price"}},
+		"descending integer key": {collection: "pk_desc", recordsets: map[string]string{"pk_desc": "id"}},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {

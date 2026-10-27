@@ -269,7 +269,7 @@ func wireCell(value any) map[string]any {
 	case string:
 		return map[string]any{"type": "text", "value": x}
 	case []byte:
-		return map[string]any{"type": "blob", "base64": base64.StdEncoding.EncodeToString(x)}
+		return map[string]any{"type": "blob", "base64": base64.RawStdEncoding.EncodeToString(x)}
 	default:
 		return map[string]any{"type": "text", "value": fmt.Sprint(x)}
 	}

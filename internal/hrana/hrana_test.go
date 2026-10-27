@@ -393,6 +393,22 @@ func TestExecuteRefusesMalformedAndOversizedResponses(t *testing.T) {
 	}
 }
 
+func TestExecuteAcceptsUnpaddedBase64Blob(t *testing.T) {
+	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		writeBody(w, pipelineOK(stmtResult(
+			[]any{map[string]any{"name": "b", "decltype": "BLOB"}},
+			[]any{map[string]any{"type": "blob", "base64": "AQ"}},
+		)))
+	}, nil)
+	result, err := client.Execute(context.Background(), "SELECT x'01'", nil)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if result.Rows[0][0].Kind != Blob || len(result.Rows[0][0].Blob) != 1 || result.Rows[0][0].Blob[0] != 1 {
+		t.Fatalf("blob = %#v", result.Rows[0][0])
+	}
+}
+
 func TestExecuteAcceptsZeroRowsAndColumns(t *testing.T) {
 	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		writeBody(w, pipelineOK(stmtResult([]any{})))

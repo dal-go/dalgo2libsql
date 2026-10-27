@@ -8,22 +8,50 @@ HTTP pipeline directly. No account, no management API, no migrations.
 
 - `Get`, `Exists`, `GetMulti` through a primary key declared in
   `Config.Recordsets`; the declaration is validated against the live catalog
-  before a statement is sent. The key is never assumed to be `id`.
+  before a statement is sent. The key is never assumed to be `id`. A keyed read
+  needs **map record data** (`record.NewRecordWithData(key, map[string]any{})`),
+  because the delegate keeps native values and a struct target is refused
+  before a statement.
 - Structured read-only queries, via the published `dalgo2sql` SQLite compiler:
-  projection, filter, `ORDER BY`, `LIMIT`/`OFFSET`, and record and recordset
-  readers. Grouping and aggregates are planned by DALgo's local strategy:
-  the adapter does not claim native aggregation, because an aggregate result
-  column has no declared type and the current recordset reader cannot hold it
-  (see the gaps below).
+  projection, filter, `ORDER BY`, `LIMIT`/`OFFSET`, `GROUP BY`, `HAVING`,
+  `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` and their `DISTINCT` forms, through record and
+  recordset readers. `QueryCapabilities` advertises exactly this set, so DALgo
+  plans those reads natively instead of using its local hash fallback.
+  `FIRST`/`LAST` and ordered aggregates are refused by the SQLite compiler and
+  are not advertised.
+- Native SQLite values through **both** readers and through `Get`/`GetMulti`:
+  `int64`, `float64`, `string`, `[]byte` (copied before the driver reuses its
+  buffer) and `nil` for `NULL`, with no affinity conversion. One column may hold
+  different classes in different rows, and a first row that is `NULL` does not
+  fix the column's type. The full `int64` range, including values above 2^53,
+  survives the decimal string encoding.
 - The five borrowed `dbschema.SchemaReader` methods from the published
-  `dalgo2sqlite` package.
+  `dalgo2sqlite` package, with a read-only token. That includes real
+  foreign-key metadata and enforcement state: the reader queries
+  `pragma_foreign_keys` (a read-only token is refused a bare `PRAGMA` with 403).
 - `Close`, idempotently.
 
 Writes, raw text SQL, joins, opaque cursors, and read/write transactions are
 refused explicitly, before any I/O. `RunReadonlyTransaction` is not
 implemented yet: a real read-only transaction needs a stateful Hrana stream,
 which this checkpoint does not have. Nothing pretends otherwise:
-`QueryCapabilities` advertises only what the SQLite compiler actually runs.
+`QueryCapabilities` advertises only what the SQLite compiler actually runs and
+what the reader tests prove.
+
+## Pinned prerequisites
+
+This checkpoint relies on two published modules, with no `replace` and no
+`go.work`:
+
+- `github.com/dal-go/dalgo2sql` **v0.31.0**, whose `DbOptions.PreserveNativeValues`
+  is SQLite-only and keeps driver values as they are. It also makes an
+  aggregate or expression column holdable as `any`.
+- `github.com/dal-go/dalgo2sqlite` **v0.5.1**, whose schema reader reads
+  foreign-key enforcement through `SELECT foreign_keys FROM pragma_foreign_keys`.
+
+Earlier versions had the two limitations this checkpoint closes: affinity-based
+recordset typing and a reader that needed a writer token for
+`DescribeCollection`.
 
 ## Quick start
 
@@ -41,6 +69,14 @@ db, err := dalgo2libsql.NewDB(ctx, dalgo2libsql.Config{
 the caller's context. A `libsql://` URL is normalized to HTTPS; plain HTTP is
 accepted only for loopback hosts with `AllowLoopbackHTTP: true`. Credentials,
 queries, fragments, and API suffixes in the URL are refused.
+
+A keyed read target is map-backed, so native values survive:
+
+```go
+rec := record.NewRecordWithData(record.NewKeyWithID("items", id), map[string]any{})
+if err := db.Get(ctx, rec); err != nil { /* ... */ }
+data := rec.Data().(map[string]any) // int64, float64, string, []byte or nil
+```
 
 See [`examples/readonly`](examples/readonly/main.go) for a full program.
 
@@ -69,36 +105,30 @@ server messages, SQL, bound values, URLs, tokens, and transport causes are never
 echoed. `context.Canceled` and `context.DeadlineExceeded` keep their identity
 through every phase.
 
-## Known gaps in this checkpoint
+## Remaining limitations
 
-These are prerequisite changes in the published dependencies, not silent
-limitations. The adapter does not claim the affected behaviour until they land.
-
-1. **Storage classes through records and recordsets.** `dalgo2sql` v0.30.5
-   builds recordset columns from `driver.RowsColumnTypeScanType`, so a column's
-   declared affinity decides the Go type a row accepts. SQLite stores any
-   class in any column, so the delegate either refuses the row (TEXT in an
-   INTEGER-declared column) or coerces it (a blob in a TEXT-declared column
-   becomes a string). The driver itself preserves the native `int64`, `float64`,
-   `string`, `[]byte`, and `nil` (`TestDriverPreservesMixedStorageClasses`).
-   A storage-preserving delegate needs one additive `dalgo2sql` option, for
-   example `DbOptions.PreserveNativeStorageClasses`, that (a) stops the records
-   reader's `[]byte`→`string` and NUMERIC normalisation, (b) makes the recordset
-   reader create an `any`-typed column instead of one derived from `ScanType`
-   (this also covers aggregate and expression columns, whose declared type is
-   null), and (c) applies the same rule to the keyed `Get` map path. Until it
-   exists, `QueryCapabilities` does not claim native grouping or aggregation;
-   DALgo computes them locally and the results are correct, just not pushed
-   down.
-
-2. **`DescribeCollection` with a read-only token.** `dalgo2sqlite` v0.5.0
-   checks foreign-key enforcement with a bare `PRAGMA foreign_keys`.
-   `libsql-server` 0.24.33 classifies a bare `PRAGMA` as a write and answers
-   403 for an `a:"ro"` JWT. The adapter's own key validation already uses the
-   table-valued `pragma_table_info` / `pragma_index_list` functions, which
-   read-only tokens may run, so keyed reads work with a reader token. The
-   borrowed `DescribeCollection` needs the upstream reader to use
-   `SELECT foreign_keys FROM pragma_foreign_keys` instead.
+- No writes, raw text SQL, joins, opaque cursors, or read-write transactions.
+  `RunReadonlyTransaction` still needs a stateful Hrana stream.
+- Keyed reads require map record data. A struct target is refused before a
+  statement, because a field type could force the conversion that native-value
+  preservation exists to avoid.
+- Grouping follows DALgo's normalized representation: a numeric group key is
+  returned as `float64`, while text and `NULL` keep their class. `SUM` and
+  `AVG` return `float64`; `COUNT` returns `int64`. `MIN`/`MAX` keep the value's
+  class. `FIRST`/`LAST` and ordered aggregates are not available on SQLite.
+- The borrowed schema reader is the strict `dalgo2sqlite` variant: a schema a
+  lossless export cannot carry is refused, not silently simplified.
+  `ListConstraints` reports primary-key, foreign-key and inline UNIQUE
+  constraints; an explicitly created unique index appears in `ListIndexes`.
+- A structured read is not a snapshot, and order is stable only when the query
+  names an `ORDER BY`.
+- Reader `Next`/`Close` errors are sanitized: `io.EOF`, `dal.ErrNoMoreRecords`,
+  `context.Canceled` and `context.DeadlineExceeded` keep their identity, and
+  anything else becomes `ErrBackend` without server text, SQL, tokens or a
+  transport cause. A broken stream is never reported as a shorter, successful
+  result.
+- This adapter checkpoint is not evidence for CLI/web consumer support or for
+  hosted Turso. The integration suite runs the pinned local server only.
 
 ## Real libSQL fixture
 
@@ -111,7 +141,10 @@ before start). Per run it generates an ephemeral Ed25519 key pair and separate
 port, proves the reader token is refused a write with 403, and seeds native
 fixtures: integer and text primary keys, a unique-only index, a nullable
 descending integer key, a composite key, a view, fractions, blobs (including
-empty), NULLs, the full `int64` range, and mixed storage classes.
+empty), NULLs, the full `int64` range, values above 2^53, mixed storage classes
+in one column, and a declared foreign key with referential actions. The child
+test process receives only the reader token; the writer token seeds and stays
+in the fixture script.
 
 ```sh
 # whole suite against the real server

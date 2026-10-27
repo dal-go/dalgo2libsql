@@ -534,10 +534,158 @@ func TestBackendDoesNotEchoServerText(t *testing.T) {
 
 func TestBackendAdvertisesOnlyCarriedCapabilities(t *testing.T) {
 	caps := (&database{}).QueryCapabilities()
-	if !caps.OrderBy {
-		t.Error("ORDER BY is carried but not advertised")
+	want := dal.QueryCapabilities{
+		GroupBy: true,
+		Having:  true,
+		OrderBy: true,
+		Aggregate: dal.AggregateCapabilities{
+			Count:         true,
+			CountDistinct: true,
+			Sum:           true,
+			SumDistinct:   true,
+			Avg:           true,
+			AvgDistinct:   true,
+			Min:           true,
+			Max:           true,
+		},
 	}
-	if caps.GroupBy || caps.Having || caps.Aggregate.Count || caps.Aggregate.OrderBy {
-		t.Fatalf("capabilities overclaim native grouping or aggregation: %#v", caps)
+	if !reflect.DeepEqual(caps, want) {
+		t.Fatalf("capabilities = %#v, want exactly %#v", caps, want)
 	}
+	// The claim selects DALgo's native plan, not its local fallback.
+	items := dal.NewRootCollectionRef("items", "")
+	grouped := dal.From(&items).NewQuery().
+		GroupBy(dal.Field("qty")).
+		Having(dal.NewComparison(dal.Count().Expression, dal.GreaterThen, dal.NewConstant(int64(0)))).
+		SelectColumns(
+			dal.Column{Expression: dal.Field("qty")},
+			dal.CountAs(dal.Star(), "n"),
+		)
+	plan, err := dal.PlanAggregation(grouped, caps)
+	if err != nil {
+		t.Fatalf("PlanAggregation: %v", err)
+	}
+	if plan.Strategy != dal.AggregationNative {
+		t.Fatalf("strategy = %q (%s), want native", plan.Strategy, plan.Reason)
+	}
+}
+
+// TestBackendAggregatesAndGroupingReachTheServer proves the capability claim
+// with the real dalgo2sql delegate and the real SQLite compiler: the grouped
+// and aggregate SQL reaches the server, through both readers, rather than
+// being computed by DALgo's local fallback.
+func TestBackendAggregatesAndGroupingReachTheServer(t *testing.T) {
+	server := seedSQLite(t)
+	db := openSeedBackend(t, server, map[string]string{"items": "id"})
+	ctx := context.Background()
+	items := dal.NewRootCollectionRef("items", "")
+
+	scalar := dal.From(&items).NewQuery().SelectColumns(
+		dal.CountAs(dal.Star(), "n"),
+		dal.SumAs(dal.Field("price"), "sum"),
+		dal.AverageAs(dal.Field("price"), "avg"),
+		dal.MinAs(dal.Field("price"), "min"),
+		dal.MaxAs(dal.Field("price"), "max"),
+		dal.CountDistinctAs(dal.Field("price"), "n_distinct"),
+		dal.SumDistinctAs(dal.Field("price"), "sum_distinct"),
+		dal.AverageDistinctAs(dal.Field("price"), "avg_distinct"),
+	)
+	reader, err := db.ExecuteQueryToRecordsReader(ctx, scalar)
+	if err != nil {
+		t.Fatalf("ExecuteQueryToRecordsReader(scalar): %v", err)
+	}
+	rows := readAllRecordValues(t, reader)
+	if err := reader.Close(); err != nil {
+		t.Fatalf("close scalar reader: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("scalar rows = %d, want 1", len(rows))
+	}
+	for name, want := range map[string]any{
+		"n":            int64(3),
+		"sum":          float64(3.75),
+		"avg":          1.875,
+		"min":          1.5,
+		"max":          2.25,
+		"n_distinct":   int64(2),
+		"sum_distinct": float64(3.75),
+		"avg_distinct": 1.875,
+	} {
+		requireNativeValue(t, "scalar "+name, rows[0][name], want)
+	}
+	for _, fragment := range []string{"SUM(", "AVG(", "COUNT(", "MIN(", "MAX("} {
+		if !server.sawStatement(fragment) {
+			t.Errorf("the aggregate %q never reached the server", fragment)
+		}
+	}
+
+	grouped := dal.From(&items).NewQuery().
+		GroupBy(dal.Field("qty")).
+		OrderBy(dal.Ascending(dal.Field("qty"))).
+		SelectColumns(
+			dal.Column{Expression: dal.Field("qty")},
+			dal.CountAs(dal.Star(), "n"),
+			dal.SumAs(dal.Field("price"), "sum"),
+		)
+	server.resetStatements()
+	reader, err = db.ExecuteQueryToRecordsReader(ctx, grouped)
+	if err != nil {
+		t.Fatalf("ExecuteQueryToRecordsReader(grouped): %v", err)
+	}
+	groups := readAllRecordValues(t, reader)
+	if err := reader.Close(); err != nil {
+		t.Fatalf("close grouped reader: %v", err)
+	}
+	if !server.sawStatement("GROUP BY") {
+		t.Fatal("the grouped read did not reach the server as SQL")
+	}
+	requireGroups(t, "grouped records", groups, []map[string]any{
+		{"qty": nil, "n": int64(1), "sum": nil},
+		{"qty": float64(42), "n": int64(1), "sum": 2.25},
+		{"qty": "not-a-number", "n": int64(1), "sum": 1.5},
+	})
+
+	having := dal.From(&items).NewQuery().
+		GroupBy(dal.Field("qty")).
+		Having(dal.NewComparison(dal.Count().Expression, dal.GreaterOrEqual, dal.NewConstant(int64(1)))).
+		OrderBy(dal.Ascending(dal.Field("qty"))).
+		SelectColumns(
+			dal.Column{Expression: dal.Field("qty")},
+			dal.CountAs(dal.Star(), "n"),
+		)
+	server.resetStatements()
+	reader, err = db.ExecuteQueryToRecordsReader(ctx, having)
+	if err != nil {
+		t.Fatalf("ExecuteQueryToRecordsReader(having): %v", err)
+	}
+	havingRows := readAllRecordValues(t, reader)
+	if err := reader.Close(); err != nil {
+		t.Fatalf("close having reader: %v", err)
+	}
+	if !server.sawStatement("HAVING") {
+		t.Fatal("the HAVING read did not reach the server as SQL")
+	}
+	if len(havingRows) != 3 {
+		t.Fatalf("having rows = %#v, want 3 groups", havingRows)
+	}
+
+	// The recordset reader runs the same native SQL and holds the aggregate
+	// results in any-typed columns.
+	server.resetStatements()
+	rsReader, err := db.ExecuteQueryToRecordsetReader(ctx, grouped)
+	if err != nil {
+		t.Fatalf("ExecuteQueryToRecordsetReader(grouped): %v", err)
+	}
+	groupSets := readAllRecordsetValues(t, rsReader)
+	if err := rsReader.Close(); err != nil {
+		t.Fatalf("close grouped recordset reader: %v", err)
+	}
+	if !server.sawStatement("GROUP BY") {
+		t.Fatal("the grouped recordset read did not reach the server as SQL")
+	}
+	requireGroups(t, "grouped recordset", groupSets, []map[string]any{
+		{"qty": nil, "n": int64(1), "sum": nil},
+		{"qty": float64(42), "n": int64(1), "sum": 2.25},
+		{"qty": "not-a-number", "n": int64(1), "sum": 1.5},
+	})
 }

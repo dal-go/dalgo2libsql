@@ -86,6 +86,12 @@ func (s *sqliteHrana) resetRequests() {
 	s.requests = 0
 }
 
+func (s *sqliteHrana) resetStatements() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.statements = nil
+}
+
 type wirePipeline struct {
 	Baton    *string `json:"baton"`
 	Requests []struct {

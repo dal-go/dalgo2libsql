@@ -11,9 +11,10 @@
 //   node scripts/libsql-fixture.mjs -- go test ./... -run TestIntegration -v
 //   node scripts/libsql-fixture.mjs --check-pins
 //
-// The child command runs with LIBSQL_FIXTURE_URL, LIBSQL_RO_TOKEN,
-// LIBSQL_RW_TOKEN and LIBSQL_REQUIRE_FIXTURE=1. Its exit status is the
-// script's; a teardown failure always fails the run.
+// The child command runs with LIBSQL_FIXTURE_URL, LIBSQL_RO_TOKEN and
+// LIBSQL_REQUIRE_FIXTURE=1. The writer token stays in this script, which uses
+// it only to seed; the test process cannot use it. The child's exit status is
+// the script's; a teardown failure always fails the run.
 import { execFileSync, spawn } from "node:child_process";
 import { generateKeyPairSync, randomBytes, sign } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -229,10 +230,32 @@ export async function seedLibSQL(url, writerToken) {
     "CREATE TABLE blobs (id INTEGER PRIMARY KEY, payload BLOB)",
     "INSERT INTO blobs (id, payload) VALUES (1, x'00ff10'), (2, NULL), (3, x'')",
     "CREATE TABLE bigints (id INTEGER PRIMARY KEY, label TEXT)",
-    "INSERT INTO bigints (id, label) VALUES (9223372036854775807, 'max'), (-9223372036854775808, 'min')",
-    // SQLite's dynamic typing: the declared affinity does not change a stored value.
+    `INSERT INTO bigints (id, label) VALUES
+      (9223372036854775807, 'max'),
+      (-9223372036854775808, 'min'),
+      (9007199254740993, 'above-2^53')`,
+    // SQLite's dynamic typing: the declared affinity does not change a stored
+    // value. declared_integer holds every storage class in different rows, and
+    // declared_text holds text, a blob, an integer and NULL.
     "CREATE TABLE mixed (id INTEGER PRIMARY KEY, declared_integer INTEGER, declared_text TEXT)",
-    "INSERT INTO mixed (id, declared_integer, declared_text) VALUES (1, 'text-in-integer', x'000102')",
+    `INSERT INTO mixed (id, declared_integer, declared_text) VALUES
+      (1, 'text-in-integer', x'000102'),
+      (2, 42, 'plain'),
+      (3, 2.5, NULL),
+      (4, x'0aff', 'seven'),
+      (5, NULL, 'last')`,
+    // A real foreign key, so the schema reader's foreign-key metadata and its
+    // read-only enforcement query are exercised instead of an unconstrained
+    // schema that would never run them.
+    "CREATE TABLE fk_parent (id INTEGER PRIMARY KEY, label TEXT NOT NULL)",
+    "INSERT INTO fk_parent (id, label) VALUES (1, 'parent-one'), (2, 'parent-two')",
+    `CREATE TABLE fk_child (
+      id INTEGER PRIMARY KEY,
+      parent_id INTEGER NOT NULL,
+      label TEXT,
+      FOREIGN KEY (parent_id) REFERENCES fk_parent(id) ON UPDATE CASCADE ON DELETE RESTRICT
+    )`,
+    "INSERT INTO fk_child (id, parent_id, label) VALUES (1, 1, 'child-one'), (2, 2, 'child-two')",
     "CREATE VIEW items_view AS SELECT id, title, rank FROM items",
   ];
   for (const sql of statements) {
@@ -378,7 +401,6 @@ async function main() {
       ...process.env,
       LIBSQL_FIXTURE_URL: fixture.url,
       LIBSQL_RO_TOKEN: fixture.readerToken,
-      LIBSQL_RW_TOKEN: fixture.writerToken,
       LIBSQL_REQUIRE_FIXTURE: "1",
     };
     if (command.length > 0) {

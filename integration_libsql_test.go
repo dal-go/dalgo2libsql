@@ -37,6 +37,9 @@ func fixtureURL(t *testing.T) (string, string) {
 	return url, token
 }
 
+// openFixtureDB opens the adapter with the fixture's read-only token. The
+// writer token is used only by the fixture script to seed; no test below has
+// access to it.
 func openFixtureDB(t *testing.T) dal.DB {
 	t.Helper()
 	url, token := fixtureURL(t)
@@ -61,10 +64,26 @@ func openFixtureDB(t *testing.T) dal.DB {
 	return db
 }
 
+// fixtureMixedRows is what each row of the fixture's mixed table holds, in its
+// native class. declared_integer holds all five SQLite storage classes in
+// different rows.
+var fixtureMixedRows = []struct {
+	id              int64
+	declaredInteger any
+	declaredText    any
+}{
+	{1, "text-in-integer", []byte{0x00, 0x01, 0x02}},
+	{2, int64(42), "plain"},
+	{3, 2.5, nil},
+	{4, []byte{0x0a, 0xff}, "seven"},
+	{5, nil, "last"},
+}
+
 func TestIntegrationReadsNativeValues(t *testing.T) {
 	db := openFixtureDB(t)
 	ctx := context.Background()
 
+	// Get through the declared key keeps every native class.
 	rec := record.NewRecordWithData(record.NewKeyWithID("items", 1), make(map[string]any))
 	if err := db.Get(ctx, rec); err != nil {
 		t.Fatalf("Get: %v", err)
@@ -79,9 +98,7 @@ func TestIntegrationReadsNativeValues(t *testing.T) {
 		"code":    "a",
 		"payload": []byte{0x00, 0xff, 0x10},
 	} {
-		if !reflect.DeepEqual(data[name], want) {
-			t.Errorf("%s = %#v, want %#v", name, data[name], want)
-		}
+		requireNativeValue(t, name, data[name], want)
 	}
 
 	// NULL stays nil: no zero value stands in for it.
@@ -94,25 +111,145 @@ func TestIntegrationReadsNativeValues(t *testing.T) {
 		t.Errorf("NULLs = %#v, %#v", data["score"], data["payload"])
 	}
 
-	// The full int64 range survives the string encoding of an integer.
-	for _, id := range []int64{math.MaxInt64, math.MinInt64} {
+	// The full int64 range and a value above 2^53 survive the string encoding
+	// of an integer, through the key and through both reader types.
+	for _, id := range []int64{math.MaxInt64, math.MinInt64, 9007199254740993} {
 		rec = record.NewRecordWithData(record.NewKeyWithID("bigints", id), make(map[string]any))
 		if err := db.Get(ctx, rec); err != nil {
 			t.Fatalf("Get(bigints %d): %v", id, err)
 		}
-		if got := rec.Data().(map[string]any)["id"]; got != id {
-			t.Errorf("bigints id = %#v, want %d", got, id)
+		requireNativeValue(t, "bigints id", rec.Data().(map[string]any)["id"], id)
+	}
+	bigints := dal.NewRootCollectionRef("bigints", "")
+	bigintQuery := dal.From(&bigints).NewQuery().
+		OrderBy(dal.Ascending(dal.Field("id"))).
+		SelectColumns(dal.Column{Expression: dal.Field("id")})
+	wantBigints := []int64{math.MinInt64, 9007199254740993, math.MaxInt64}
+	recordsReader, err := db.ExecuteQueryToRecordsReader(ctx, bigintQuery)
+	if err != nil {
+		t.Fatalf("ExecuteQueryToRecordsReader(bigints): %v", err)
+	}
+	for i, row := range readAllRecordValues(t, recordsReader) {
+		requireNativeValue(t, "bigints records id", row["id"], wantBigints[i])
+	}
+	if err := recordsReader.Close(); err != nil {
+		t.Fatalf("close bigints records reader: %v", err)
+	}
+	recordsetReader, err := db.ExecuteQueryToRecordsetReader(ctx, bigintQuery)
+	if err != nil {
+		t.Fatalf("ExecuteQueryToRecordsetReader(bigints): %v", err)
+	}
+	for i, row := range readAllRecordsetValues(t, recordsetReader) {
+		requireNativeValue(t, "bigints recordset id", row["id"], wantBigints[i])
+	}
+	if err := recordsetReader.Close(); err != nil {
+		t.Fatalf("close bigints recordset reader: %v", err)
+	}
+
+	// GetMulti keeps the same classes for every row.
+	records := make([]record.Record, len(fixtureMixedRows))
+	for i, row := range fixtureMixedRows {
+		records[i] = record.NewRecordWithData(record.NewKeyWithID("mixed", row.id), make(map[string]any))
+	}
+	if err := db.GetMulti(ctx, records); err != nil {
+		t.Fatalf("GetMulti: %v", err)
+	}
+	for i, row := range fixtureMixedRows {
+		data = records[i].Data().(map[string]any)
+		requireNativeValue(t, "mixed id", data["id"], row.id)
+		requireNativeValue(t, "mixed declared_integer", data["declared_integer"], row.declaredInteger)
+		requireNativeValue(t, "mixed declared_text", data["declared_text"], row.declaredText)
+		if !records[i].Exists() {
+			t.Errorf("mixed row %d is not marked as read", row.id)
 		}
 	}
 
-	// SQLite's dynamic typing: a TEXT value in an INTEGER-declared column is
-	// read as text, not coerced to an integer.
-	rec = record.NewRecordWithData(record.NewKeyWithID("mixed", 1), make(map[string]any))
+	// A returned []byte is the caller's: mutating it changes neither another
+	// read nor the stored value. dalgo2sql copies the driver's buffer; this
+	// holds the adapter to that ownership at its own boundary.
+	blob := records[3].Data().(map[string]any)["declared_integer"].([]byte)
+	blob[0] = 0x7f
+	rec = record.NewRecordWithData(record.NewKeyWithID("mixed", 4), make(map[string]any))
 	if err := db.Get(ctx, rec); err != nil {
-		t.Fatalf("Get(mixed): %v", err)
+		t.Fatalf("Get(mixed 4) after mutation: %v", err)
 	}
-	if got := rec.Data().(map[string]any)["declared_integer"]; got != "text-in-integer" {
-		t.Errorf("mixed.declared_integer = %#v, want the stored TEXT", got)
+	requireNativeValue(t, "copied blob", rec.Data().(map[string]any)["declared_integer"], []byte{0x0a, 0xff})
+
+	mixed := dal.NewRootCollectionRef("mixed", "")
+	mixedQuery := dal.From(&mixed).NewQuery().
+		OrderBy(dal.Ascending(dal.Field("id"))).
+		SelectIntoRecordset()
+
+	// The records reader: one column, five storage classes.
+	recordsReader, err = db.ExecuteQueryToRecordsReader(ctx, mixedQuery)
+	if err != nil {
+		t.Fatalf("ExecuteQueryToRecordsReader(mixed): %v", err)
+	}
+	mixedRecords := readAllRecordValues(t, recordsReader)
+	if err := recordsReader.Close(); err != nil {
+		t.Fatalf("close mixed records reader: %v", err)
+	}
+	if len(mixedRecords) != len(fixtureMixedRows) {
+		t.Fatalf("mixed records = %d rows, want %d", len(mixedRecords), len(fixtureMixedRows))
+	}
+	for i, row := range fixtureMixedRows {
+		requireNativeValue(t, "mixed records declared_integer", mixedRecords[i]["declared_integer"], row.declaredInteger)
+		requireNativeValue(t, "mixed records declared_text", mixedRecords[i]["declared_text"], row.declaredText)
+	}
+
+	// The recordset reader: the same heterogeneous column, still any-typed.
+	recordsetReader, err = db.ExecuteQueryToRecordsetReader(ctx, mixedQuery)
+	if err != nil {
+		t.Fatalf("ExecuteQueryToRecordsetReader(mixed): %v", err)
+	}
+	mixedRows := readAllRecordsetValues(t, recordsetReader)
+	if err := recordsetReader.Close(); err != nil {
+		t.Fatalf("close mixed recordset reader: %v", err)
+	}
+	if len(mixedRows) != len(fixtureMixedRows) {
+		t.Fatalf("mixed recordset = %d rows, want %d", len(mixedRows), len(fixtureMixedRows))
+	}
+	for i, row := range fixtureMixedRows {
+		requireNativeValue(t, "mixed recordset declared_integer", mixedRows[i]["declared_integer"], row.declaredInteger)
+		requireNativeValue(t, "mixed recordset declared_text", mixedRows[i]["declared_text"], row.declaredText)
+	}
+
+	// SQLite orders NULL first in ascending order. The first row's column is
+	// nil and does not fix the column's type for the rows that follow.
+	nullsFirst := dal.From(dal.NewRootCollectionRef("items", "")).NewQuery().
+		OrderBy(dal.Ascending(dal.Field("score"))).
+		SelectColumns(
+			dal.Column{Expression: dal.Field("id")},
+			dal.Column{Expression: dal.Field("score")},
+		)
+	recordsReader, err = db.ExecuteQueryToRecordsReader(ctx, nullsFirst)
+	if err != nil {
+		t.Fatalf("ExecuteQueryToRecordsReader(nulls first): %v", err)
+	}
+	first, err := recordsReader.Next()
+	if err != nil {
+		t.Fatalf("Next(nulls first): %v", err)
+	}
+	if first.Data().(map[string]any)["score"] != nil {
+		t.Fatalf("first record score = %#v, want NULL", first.Data().(map[string]any)["score"])
+	}
+	if err := recordsReader.Close(); err != nil {
+		t.Fatalf("close nulls-first records reader: %v", err)
+	}
+	recordsetReader, err = db.ExecuteQueryToRecordsetReader(ctx, nullsFirst)
+	if err != nil {
+		t.Fatalf("ExecuteQueryToRecordsetReader(nulls first): %v", err)
+	}
+	firstRow, firstSet, err := recordsetReader.Next()
+	if err != nil {
+		t.Fatalf("Next(nulls first recordset): %v", err)
+	}
+	score, err := firstRow.GetValueByName("score", firstSet)
+	if err != nil || score != nil {
+		t.Fatalf("first recordset score = %#v, %v, want NULL", score, err)
+	}
+	if err := recordsetReader.Close(); err != nil {
+		t.Fatalf("close nulls-first recordset reader: %v", err)
 	}
 }
 
@@ -239,13 +376,20 @@ func TestIntegrationStructuredReadsStayStable(t *testing.T) {
 	}
 }
 
+// TestIntegrationBorrowedSchema runs all five schema-reader methods with the
+// fixture's a:"ro" token. The foreign-key assertion is real: it reads a table
+// that declares a foreign key, so the reader's enforcement query and its
+// foreign-key metadata path both actually run. A read-only token is refused a
+// bare PRAGMA with 403, so a passing DescribeCollection also proves the reader
+// used the table-valued function.
 func TestIntegrationBorrowedSchema(t *testing.T) {
 	db := openFixtureDB(t)
 	reader, ok := dal.As[dbschema.SchemaReader](db)
 	if !ok {
 		t.Fatal("the backend does not expose the borrowed schema reader")
 	}
-	collections, err := reader.ListCollections(context.Background(), nil)
+	ctx := context.Background()
+	collections, err := reader.ListCollections(ctx, nil)
 	if err != nil {
 		t.Fatalf("ListCollections: %v", err)
 	}
@@ -253,41 +397,46 @@ func TestIntegrationBorrowedSchema(t *testing.T) {
 	for _, collection := range collections {
 		found[collection.Name()] = true
 	}
-	for _, name := range []string{"items", "labels", "composite", "metrics", "bigints"} {
+	for _, name := range []string{"items", "labels", "composite", "metrics", "bigints", "fk_parent", "fk_child"} {
 		if !found[name] {
 			t.Errorf("collection %q is missing from %#v", name, found)
 		}
 	}
-	// dalgo2sqlite v0.5.0's DescribeCollection issues a bare `PRAGMA
-	// foreign_keys`, and libsql-server 0.24.33 classifies a bare PRAGMA as a
-	// write and refuses it for an `a:"ro"` token (403). The data path below
-	// still uses the read-only token; this one metadata call uses the writer
-	// token until dalgo2sqlite reads `pragma_foreign_keys` instead.
-	rwDB, err := NewDB(context.Background(), Config{
-		URL:               os.Getenv("LIBSQL_FIXTURE_URL"),
-		AllowLoopbackHTTP: true,
-		Headers: func(context.Context) (map[string]string, error) {
-			return map[string]string{"Authorization": "Bearer " + os.Getenv("LIBSQL_RW_TOKEN")}, nil
-		},
-	})
+
+	itemsRef := dal.NewRootCollectionRef("items", "")
+	def, err := reader.DescribeCollection(ctx, &itemsRef)
 	if err != nil {
-		t.Fatalf("NewDB(rw): %v", err)
-	}
-	defer closeDB(t, rwDB)
-	rwReader, ok := dal.As[dbschema.SchemaReader](rwDB)
-	if !ok {
-		t.Fatal("the backend does not expose the schema reader")
-	}
-	ref := dal.NewRootCollectionRef("items", "")
-	def, err := rwReader.DescribeCollection(context.Background(), &ref)
-	if err != nil {
-		t.Fatalf("DescribeCollection: %v", err)
+		t.Fatalf("DescribeCollection(items): %v", err)
 	}
 	if len(def.PrimaryKey) != 1 || string(def.PrimaryKey[0]) != "id" {
 		t.Fatalf("primary key = %#v", def.PrimaryKey)
 	}
+
+	childRef := dal.NewRootCollectionRef("fk_child", "")
+	child, err := reader.DescribeCollection(ctx, &childRef)
+	if err != nil {
+		t.Fatalf("DescribeCollection(fk_child): %v", err)
+	}
+	if len(child.ForeignKeys) != 1 {
+		t.Fatalf("foreign keys = %+v", child.ForeignKeys)
+	}
+	fk := child.ForeignKeys[0]
+	if fk.ReferencedCollection != "fk_parent" || len(fk.Fields) != 1 || fk.Fields[0] != "parent_id" ||
+		len(fk.ReferencedFields) != 1 || fk.ReferencedFields[0] != "id" {
+		t.Fatalf("foreign key = %+v", fk)
+	}
+	if fk.OnUpdate != "CASCADE" || fk.OnDelete != "RESTRICT" {
+		t.Fatalf("referential actions = %+v", fk)
+	}
+	// The pinned libSQL server enables foreign-key enforcement by default.
+	// The value is what the reader's pragma_foreign_keys query returned; a
+	// bare PRAGMA would have been refused for this token.
+	if fk.Enforcement != dbschema.ForeignKeyEnforcementEnabled {
+		t.Fatalf("enforcement = %q, want the pinned server's enabled state", fk.Enforcement)
+	}
+
 	labelsRef := dal.NewRootCollectionRef("labels", "")
-	indexes, err := reader.ListIndexes(context.Background(), &labelsRef)
+	indexes, err := reader.ListIndexes(ctx, &labelsRef)
 	if err != nil {
 		t.Fatalf("ListIndexes: %v", err)
 	}
@@ -299,6 +448,32 @@ func TestIntegrationBorrowedSchema(t *testing.T) {
 	}
 	if !unique {
 		t.Fatalf("the unique index is missing from %#v", indexes)
+	}
+
+	constraints, err := reader.ListConstraints(ctx, &childRef)
+	if err != nil {
+		t.Fatalf("ListConstraints(fk_child): %v", err)
+	}
+	types := map[string]bool{}
+	for _, constraint := range constraints {
+		types[constraint.Type] = true
+	}
+	if !types["primary-key"] || !types["foreign-key"] {
+		t.Fatalf("constraints = %+v", constraints)
+	}
+	parentRef := dal.NewRootCollectionRef("fk_parent", "")
+	referrers, err := reader.ListReferrers(ctx, &parentRef)
+	if err != nil {
+		t.Fatalf("ListReferrers(fk_parent): %v", err)
+	}
+	foundReferrer := false
+	for _, referrer := range referrers {
+		if referrer.Collection.Name() == "fk_child" && len(referrer.Fields) == 1 && referrer.Fields[0] == "parent_id" {
+			foundReferrer = true
+		}
+	}
+	if !foundReferrer {
+		t.Fatalf("referrers = %+v", referrers)
 	}
 }
 
@@ -361,76 +536,149 @@ func TestIntegrationReaderTokenCannotWrite(t *testing.T) {
 	}
 }
 
-func TestIntegrationAggregatesUseTheLocalPlan(t *testing.T) {
+// TestIntegrationAggregatesAndGroupingRunNatively holds the adapter's
+// capability claim to the real server: the same aggregate, grouped and HAVING
+// queries run through both readers, and DALgo plans each of them natively.
+func TestIntegrationAggregatesAndGroupingRunNatively(t *testing.T) {
 	db := openFixtureDB(t)
+	ctx := context.Background()
 	items := dal.NewRootCollectionRef("items", "")
-	query := dal.From(&items).NewQuery().SelectColumns(dal.Count())
 
-	reader, err := db.ExecuteQueryToRecordsReader(context.Background(), query)
-	if err != nil {
-		t.Fatalf("ExecuteQueryToRecordsReader(count): %v", err)
+	provider, ok := dal.BackendOf(db).(dal.QueryCapabilitiesProvider)
+	if !ok {
+		t.Fatal("the backend does not advertise query capabilities")
 	}
-	rec, err := reader.Next()
-	if err != nil {
-		t.Fatalf("Next(count): %v", err)
-	}
-	data := rec.Data().(map[string]any)
-	if data["COUNT(*)"] != 12 && data["COUNT(*)"] != int64(12) {
-		t.Fatalf("record count = %#v", data)
-	}
-	_ = reader.Close()
+	caps := provider.QueryCapabilities()
 
-	rsReader, err := db.ExecuteQueryToRecordsetReader(context.Background(), query)
-	if err != nil {
-		t.Fatalf("ExecuteQueryToRecordsetReader(count): %v", err)
-	}
-	defer func() { _ = rsReader.Close() }()
-	row, rs, err := rsReader.Next()
-	if err != nil {
-		t.Fatalf("Next(count recordset): %v", err)
-	}
-	name := rs.Columns()[0].Name()
-	count, err := row.GetValueByName(name, rs)
-	if err != nil {
-		t.Fatalf("count value: %v", err)
-	}
-	if count != 12 && count != int64(12) {
-		t.Fatalf("recordset count = %#v", count)
-	}
-
+	scalar := dal.From(&items).NewQuery().SelectColumns(
+		dal.CountAs(dal.Star(), "n"),
+		dal.SumAs(dal.Field("score"), "sum"),
+		dal.AverageAs(dal.Field("score"), "avg"),
+		dal.MinAs(dal.Field("score"), "min"),
+		dal.MaxAs(dal.Field("score"), "max"),
+		dal.CountDistinctAs(dal.Field("score"), "n_distinct"),
+		dal.SumDistinctAs(dal.Field("score"), "sum_distinct"),
+		dal.AverageDistinctAs(dal.Field("score"), "avg_distinct"),
+	)
 	grouped := dal.From(&items).NewQuery().
 		GroupBy(dal.Field("rank")).
-		SelectColumns(dal.Column{Expression: dal.Field("rank")}, dal.Count())
-	groupReader, err := db.ExecuteQueryToRecordsetReader(context.Background(), grouped)
+		OrderBy(dal.Ascending(dal.Field("rank"))).
+		SelectColumns(
+			dal.Column{Expression: dal.Field("rank")},
+			dal.CountAs(dal.Star(), "n"),
+			dal.SumAs(dal.Field("score"), "sum"),
+			dal.AverageAs(dal.Field("score"), "avg"),
+			dal.MinAs(dal.Field("score"), "min"),
+			dal.MaxAs(dal.Field("score"), "max"),
+		)
+	having := dal.From(&items).NewQuery().
+		GroupBy(dal.Field("rank")).
+		Having(dal.NewComparison(dal.Count().Expression, dal.GreaterOrEqual, dal.NewConstant(int64(3)))).
+		OrderBy(dal.Ascending(dal.Field("rank"))).
+		SelectColumns(
+			dal.Column{Expression: dal.Field("rank")},
+			dal.CountAs(dal.Star(), "n"),
+		)
+
+	for name, query := range map[string]dal.Query{"scalar": scalar, "grouped": grouped, "having": having} {
+		plan, err := dal.PlanAggregation(query.(dal.StructuredQuery), caps)
+		if err != nil {
+			t.Fatalf("%s: PlanAggregation: %v", name, err)
+		}
+		if plan.Strategy != dal.AggregationNative {
+			t.Fatalf("%s: strategy = %q (%s), want native", name, plan.Strategy, plan.Reason)
+		}
+	}
+
+	wantScalar := map[string]any{
+		"n":            int64(12),
+		"sum":          float64(28.5),
+		"avg":          28.5 / 7,
+		"min":          0.5,
+		"max":          9.5,
+		"n_distinct":   int64(7),
+		"sum_distinct": float64(28.5),
+		"avg_distinct": 28.5 / 7,
+	}
+	recordsReader, err := db.ExecuteQueryToRecordsReader(ctx, scalar)
 	if err != nil {
-		t.Fatalf("ExecuteQueryToRecordsetReader(group): %v", err)
+		t.Fatalf("ExecuteQueryToRecordsReader(scalar): %v", err)
 	}
-	defer func() { _ = groupReader.Close() }()
-	rows, total := 0, int64(0)
-	for {
-		row, rs, err := groupReader.Next()
-		if errors.Is(err, dal.ErrNoMoreRecords) {
-			break
-		}
-		if err != nil {
-			t.Fatalf("Next(group): %v", err)
-		}
-		rows++
-		name := rs.Columns()[1].Name()
-		value, err := row.GetValueByName(name, rs)
-		if err != nil {
-			t.Fatalf("group count: %v", err)
-		}
-		switch n := value.(type) {
-		case int64:
-			total += n
-		case int:
-			total += int64(n)
-		default:
-			t.Fatalf("group count = %#v", value)
-		}
+	scalarRows := readAllRecordValues(t, recordsReader)
+	if err := recordsReader.Close(); err != nil {
+		t.Fatalf("close scalar records reader: %v", err)
 	}
-	if rows != 4 || total != 12 {
-		t.Fatalf("groups = %d, total = %d", rows, total)
+	if len(scalarRows) != 1 {
+		t.Fatalf("scalar records = %d rows, want 1", len(scalarRows))
 	}
+	for name, want := range wantScalar {
+		requireNativeValue(t, "scalar records "+name, scalarRows[0][name], want)
+	}
+	recordsetReader, err := db.ExecuteQueryToRecordsetReader(ctx, scalar)
+	if err != nil {
+		t.Fatalf("ExecuteQueryToRecordsetReader(scalar): %v", err)
+	}
+	scalarSets := readAllRecordsetValues(t, recordsetReader)
+	if err := recordsetReader.Close(); err != nil {
+		t.Fatalf("close scalar recordset reader: %v", err)
+	}
+	if len(scalarSets) != 1 {
+		t.Fatalf("scalar recordset = %d rows, want 1", len(scalarSets))
+	}
+	for name, want := range wantScalar {
+		requireNativeValue(t, "scalar recordset "+name, scalarSets[0][name], want)
+	}
+
+	// The NULL rank is its own group and sorts first; MIN/MAX ignore the NULL
+	// scores inside each group, as SQL defines them.
+	wantGroups := []map[string]any{
+		{"rank": nil, "n": int64(2), "sum": 0.5, "avg": 0.5, "min": 0.5, "max": 0.5},
+		{"rank": float64(1), "n": int64(3), "sum": 10.5, "avg": 5.25, "min": 3.5, "max": 7.0},
+		{"rank": float64(2), "n": int64(4), "sum": 12.0, "avg": 6.0, "min": 2.5, "max": 9.5},
+		{"rank": float64(3), "n": int64(3), "sum": 5.5, "avg": 2.75, "min": 1.25, "max": 4.25},
+	}
+	recordsReader, err = db.ExecuteQueryToRecordsReader(ctx, grouped)
+	if err != nil {
+		t.Fatalf("ExecuteQueryToRecordsReader(grouped): %v", err)
+	}
+	groupRows := readAllRecordValues(t, recordsReader)
+	if err := recordsReader.Close(); err != nil {
+		t.Fatalf("close grouped records reader: %v", err)
+	}
+	requireGroups(t, "grouped records", groupRows, wantGroups)
+	recordsetReader, err = db.ExecuteQueryToRecordsetReader(ctx, grouped)
+	if err != nil {
+		t.Fatalf("ExecuteQueryToRecordsetReader(grouped): %v", err)
+	}
+	groupSets := readAllRecordsetValues(t, recordsetReader)
+	if err := recordsetReader.Close(); err != nil {
+		t.Fatalf("close grouped recordset reader: %v", err)
+	}
+	requireGroups(t, "grouped recordset", groupSets, wantGroups)
+
+	// HAVING drops the two-row NULL group: only ranks with three or more rows
+	// remain, through both readers.
+	wantHaving := []map[string]any{
+		{"rank": float64(1), "n": int64(3)},
+		{"rank": float64(2), "n": int64(4)},
+		{"rank": float64(3), "n": int64(3)},
+	}
+	recordsReader, err = db.ExecuteQueryToRecordsReader(ctx, having)
+	if err != nil {
+		t.Fatalf("ExecuteQueryToRecordsReader(having): %v", err)
+	}
+	havingRows := readAllRecordValues(t, recordsReader)
+	if err := recordsReader.Close(); err != nil {
+		t.Fatalf("close having records reader: %v", err)
+	}
+	requireGroups(t, "having records", havingRows, wantHaving)
+	recordsetReader, err = db.ExecuteQueryToRecordsetReader(ctx, having)
+	if err != nil {
+		t.Fatalf("ExecuteQueryToRecordsetReader(having): %v", err)
+	}
+	havingSets := readAllRecordsetValues(t, recordsetReader)
+	if err := recordsetReader.Close(); err != nil {
+		t.Fatalf("close having recordset reader: %v", err)
+	}
+	requireGroups(t, "having recordset", havingSets, wantHaving)
 }

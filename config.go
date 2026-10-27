@@ -78,6 +78,10 @@ type Config struct {
 	// declaration is checked against the live schema before it is used.
 	// Structured reads discover their key from the SQLite catalog themselves
 	// and do not need a declaration.
+	//
+	// A keyed read target must be map record data: the delegate preserves the
+	// native SQLite value of every column, and a struct target is refused
+	// before a statement because a field type could force a conversion.
 	Recordsets map[string]string
 
 	// MaxOpenConns bounds the private pool. Default 1: schema probes and the
@@ -197,21 +201,21 @@ func NewDB(ctx context.Context, cfg Config) (dal.DB, error) {
 		return nil, fmt.Errorf("%w: schema reader: %s", ErrInvalidConfig, err)
 	}
 
-	// KNOWN GAP in this checkpoint: dalgo2sql v0.30.5 builds recordset
-	// columns from driver.RowsColumnTypeScanType, so a column's declared
-	// affinity decides the Go type a recordset row accepts. SQLite stores any
-	// storage class in any column, and the delegate then either refuses the
-	// row (TEXT in an INTEGER-declared column) or coerces it (a blob in a
-	// TEXT-declared column becomes a string). The driver itself never coerces
-	// (see TestDriverPreservesMixedStorageClasses), and records preserve every
-	// class except a blob in a non-BLOB-declared column or NUMERIC text. A
-	// storage-preserving delegate needs an additive dalgo2sql option (see the
-	// handoff note in README.md); until it exists this adapter does not claim
-	// mixed storage classes through records and recordsets.
+	// PreserveNativeValues keeps the value libSQL delivers for each result
+	// column: int64, float64, string, []byte (already copied by the delegate) or
+	// nil for NULL, with no affinity or text normalization. One recordset column
+	// may therefore hold any of those classes in different rows, and an aggregate
+	// or expression column has a value without needing a declared type.
+	//
+	// Keyed reads (Get, GetMulti) and structured records readers into map data
+	// keep those values. A struct target is refused by the delegate before a
+	// statement: a field type could force the very conversion the option exists
+	// to avoid, so this adapter documents map record data for keyed reads.
 	delegate := dalgo2sql.NewDatabase(pool, dal.NewSchema(nil, nil), dalgo2sql.DbOptions{
 		ID:                     cfg.ID,
 		Recordsets:             recordsets,
 		StructuredQueryDialect: dialectSQLite,
+		PreserveNativeValues:   true,
 	})
 
 	id := cfg.ID

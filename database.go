@@ -69,16 +69,30 @@ func (d *database) Adapter() dal.Adapter { return dal.NewAdapter("dalgo2libsql",
 func (d *database) Schema() dal.Schema { return d.schema }
 
 // QueryCapabilities explicitly advertises only what this backend runs natively
-// and preserves exactly for both readers. ORDER BY is safe. GROUP BY, HAVING
-// and the aggregate subset are not advertised: SQLite compiles them, but
-// dalgo2sql v0.30.5 types a recordset column from driver.RowsColumnTypeScanType,
-// and an aggregate or expression column has no declared type, so the recordset
-// reader refuses the value it delivered (see README, known gaps). DALgo then
-// plans those queries with its local strategy over the reads this backend does
-// preserve, instead of receiving a capability claim the recordset path cannot
-// honour.
+// and preserves exactly through both readers. ORDER BY, GROUP BY, HAVING and
+// the aggregate subset SQLite runs are always sent as SQL: dalgo2sql v0.31.0
+// with PreserveNativeValues types every recordset column as any, so a grouped
+// or aggregate result is held without a declared type and a finite result is
+// checked. FIRST and LAST are not advertised because the SQLite compiler refuses
+// them: they need a deterministic aggregate order this adapter does not claim.
+// StableRowOrder and GroupKeyOrder are not claimed either; DALgo's local plans
+// that need them stay local.
 func (d *database) QueryCapabilities() dal.QueryCapabilities {
-	return dal.QueryCapabilities{OrderBy: true}
+	return dal.QueryCapabilities{
+		GroupBy: true,
+		Having:  true,
+		OrderBy: true,
+		Aggregate: dal.AggregateCapabilities{
+			Count:         true,
+			CountDistinct: true,
+			Sum:           true,
+			SumDistinct:   true,
+			Avg:           true,
+			AvgDistinct:   true,
+			Min:           true,
+			Max:           true,
+		},
+	}
 }
 
 // Get reads one record through its declared primary key. A collection whose
@@ -209,14 +223,15 @@ func (r *boundedRecordsReader) Next() (dalrecord.Record, error) {
 	rec, err := r.RecordsReader.Next()
 	if err != nil {
 		r.op.done()
+		return rec, sanitizeReaderError(err)
 	}
-	return rec, err
+	return rec, nil
 }
 
 func (r *boundedRecordsReader) Close() error {
 	err := r.RecordsReader.Close()
 	r.op.done()
-	return err
+	return sanitizeReaderError(err)
 }
 
 // boundedRecordsetReader is the recordset counterpart.
@@ -229,14 +244,15 @@ func (r *boundedRecordsetReader) Next() (recordset.Row, recordset.Recordset, err
 	row, rs, err := r.RecordsetReader.Next()
 	if err != nil {
 		r.op.done()
+		return row, rs, sanitizeReaderError(err)
 	}
-	return row, rs, err
+	return row, rs, nil
 }
 
 func (r *boundedRecordsetReader) Close() error {
 	err := r.RecordsetReader.Close()
 	r.op.done()
-	return err
+	return sanitizeReaderError(err)
 }
 
 // RunReadonlyTransaction is not implemented: a real read-only transaction
@@ -284,12 +300,22 @@ type operation struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	budget *hrana.Budget
+
+	doneOnce sync.Once
 }
 
+// done releases the operation's deadline and budget exactly once. A reader
+// calls it when it is exhausted, fails or is closed; a second call (for example
+// a Close after a failing Next) has no further effect.
 func (o *operation) done() {
-	if o != nil && o.cancel != nil {
-		o.cancel()
+	if o == nil {
+		return
 	}
+	o.doneOnce.Do(func() {
+		if o.cancel != nil {
+			o.cancel()
+		}
+	})
 }
 
 // begin establishes the operation's deadline and budget before any preflight,
@@ -546,6 +572,25 @@ func (d *database) ListReferrers(ctx context.Context, ref *dal.CollectionRef) ([
 // classify. It deliberately carries no server text, SQL, URL or transport
 // detail.
 var ErrBackend = errors.New("dalgo2libsql: the read failed")
+
+// sanitizeReaderError is the reader-side boundary. The end of a result is a
+// state, not a failure: the exact io.EOF and dal.ErrNoMoreRecords values are
+// kept, and nothing else may look like one. A stream error that merely wraps
+// io.EOF is not exhaustion (the delegate unwraps its own such errors), and an
+// error that wraps dal.ErrNoMoreRecords, such as dal.ErrLimitReached, is a
+// failure too. A failed Next or Close is therefore never reported as a shorter,
+// successful result. Every other error goes through sanitizeReadError, which
+// keeps context identity and the adapter's classified errors and replaces
+// server text, SQL, bound values, tokens and transport causes with ErrBackend.
+func sanitizeReaderError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if err == dal.ErrNoMoreRecords || err == io.EOF {
+		return err
+	}
+	return sanitizeReadError(err)
+}
 
 // sanitizeReadError keeps context identity and the adapter's own classified
 // errors, and replaces anything else with ErrBackend so a server message, SQL

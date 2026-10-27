@@ -36,6 +36,7 @@ func run() error {
 	url := flag.String("url", os.Getenv("LIBSQL_URL"), "libSQL base URL (libsql:// or https://)")
 	table := flag.String("table", "items", "table to read")
 	key := flag.String("key", "1", "primary key value")
+	allowLoopback := flag.Bool("allow-loopback-http", false, "allow plain HTTP to a loopback host (local development only)")
 	flag.Parse()
 
 	token := os.Getenv("LIBSQL_TOKEN")
@@ -50,7 +51,8 @@ func run() error {
 	defer cancel()
 
 	db, err := dalgo2libsql.NewDB(ctx, dalgo2libsql.Config{
-		URL: *url,
+		URL:               *url,
+		AllowLoopbackHTTP: *allowLoopback,
 		Headers: func(context.Context) (map[string]string, error) {
 			return map[string]string{"Authorization": "Bearer " + token}, nil
 		},

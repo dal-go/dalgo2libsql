@@ -397,4 +397,40 @@ func TestIntegrationAggregatesUseTheLocalPlan(t *testing.T) {
 	if count != 12 && count != int64(12) {
 		t.Fatalf("recordset count = %#v", count)
 	}
+
+	grouped := dal.From(&items).NewQuery().
+		GroupBy(dal.Field("rank")).
+		SelectColumns(dal.Column{Expression: dal.Field("rank")}, dal.Count())
+	groupReader, err := db.ExecuteQueryToRecordsetReader(context.Background(), grouped)
+	if err != nil {
+		t.Fatalf("ExecuteQueryToRecordsetReader(group): %v", err)
+	}
+	defer func() { _ = groupReader.Close() }()
+	rows, total := 0, int64(0)
+	for {
+		row, rs, err := groupReader.Next()
+		if errors.Is(err, dal.ErrNoMoreRecords) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("Next(group): %v", err)
+		}
+		rows++
+		name := rs.Columns()[1].Name()
+		value, err := row.GetValueByName(name, rs)
+		if err != nil {
+			t.Fatalf("group count: %v", err)
+		}
+		switch n := value.(type) {
+		case int64:
+			total += n
+		case int:
+			total += int64(n)
+		default:
+			t.Fatalf("group count = %#v", value)
+		}
+	}
+	if rows != 4 || total != 12 {
+		t.Fatalf("groups = %d, total = %d", rows, total)
+	}
 }

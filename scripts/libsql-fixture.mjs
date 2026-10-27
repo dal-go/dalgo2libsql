@@ -15,9 +15,9 @@
 // LIBSQL_REQUIRE_FIXTURE=1. The writer token stays in this script, which uses
 // it only to seed; the test process cannot use it. The child's exit status is
 // the script's; a teardown failure always fails the run.
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { generateKeyPairSync, randomBytes, sign } from "node:crypto";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -80,6 +80,18 @@ function isMissingDockerObject(error) {
 
 function dockerRun(run, args, options = {}) {
   return run("docker", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], ...options });
+}
+
+/**
+ * Best-effort container state and tail of its logs for a failed health check.
+ * Diagnostics never throw and never hide the original health failure.
+ */
+function containerDiagnostics(name) {
+  const inspect = spawnSync("docker", ["inspect", "--format", "{{json .State}}", name], { encoding: "utf8" });
+  const logs = spawnSync("docker", ["logs", "--tail", "80", name], { encoding: "utf8" });
+  const state = (inspect.stdout || inspect.stderr || "").trim();
+  const output = [logs.stdout, logs.stderr].filter(Boolean).join("").trim();
+  return `state: ${state || "unavailable"}\nlogs:\n${output || "unavailable"}`;
 }
 
 /**
@@ -274,7 +286,16 @@ export async function startLibSQLFixture() {
   const name = `dalgo-libsql-fixture-${stamp}`;
   const work = mkdtempSync(join(tmpdir(), `${name}-`));
   const { publicKey, privateKey } = generateKeyPairSync("ed25519");
-  writeFileSync(join(work, "public.pem"), publicKey.export({ type: "spki", format: "pem" }));
+  const publicKeyFile = join(work, "public.pem");
+  writeFileSync(publicKeyFile, publicKey.export({ type: "spki", format: "pem" }));
+  // mkdtemp creates the directory 0700. On a Linux runner the container runs
+  // as its own user, so a 0700 host directory and a 0600 key file are not
+  // traversable/readable through a bind mount (the server exits and the health
+  // check sees only a refused fetch). The public key is not secret: make the
+  // directory and key world-readable, never the private key, which stays in
+  // this process only.
+  chmodSync(work, 0o755);
+  chmodSync(publicKeyFile, 0o644);
 
   const token = (permission) => {
     const header = base64url(JSON.stringify({ alg: "EdDSA", typ: "JWT" }));
@@ -341,7 +362,9 @@ export async function startLibSQLFixture() {
       }
       await new Promise((resolve) => setTimeout(resolve, 250));
     }
-    if (!ready) throw new Error(`libSQL fixture did not become healthy: ${last}`);
+    if (!ready) {
+      throw new Error(`libSQL fixture did not become healthy: ${last}\n${containerDiagnostics(name)}`);
+    }
     return {
       ...metadata,
       name,

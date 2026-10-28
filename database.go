@@ -580,8 +580,9 @@ var ErrBackend = errors.New("dalgo2libsql: the read failed")
 // error that wraps dal.ErrNoMoreRecords, such as dal.ErrLimitReached, is a
 // failure too. A failed Next or Close is therefore never reported as a shorter,
 // successful result. Every other error goes through sanitizeReadError, which
-// keeps context identity and the adapter's classified errors and replaces
-// server text, SQL, bound values, tokens and transport causes with ErrBackend.
+// keeps context and classification identity while replacing the original
+// wrapper, and with it any server text, SQL, bound values, tokens and transport
+// causes, with a canonical error.
 func sanitizeReaderError(err error) error {
 	if err == nil {
 		return nil
@@ -592,29 +593,54 @@ func sanitizeReaderError(err error) error {
 	return sanitizeReadError(err)
 }
 
-// sanitizeReadError keeps context identity and the adapter's own classified
-// errors, and replaces anything else with ErrBackend so a server message, SQL
-// text, a column of a broken stream or a transport detail never reaches the
-// caller.
+// sanitizeReadError reports every recognized classification as its canonical
+// value, and anything else as ErrBackend, so a server message, SQL text, a
+// column of a broken stream or a transport detail never reaches the caller.
+//
+// The recognized error itself is never returned as it arrived: it may be a
+// wrapper, built by a transport or a delegate, whose message and retained cause
+// contain a URL, a token, SQL or a body. Returning only the sentinel preserves
+// errors.Is identity while dropping that text; where the caller also needs the
+// read to be recognizable as a backend failure, the canonical sentinel is
+// wrapped in ErrBackend rather than the untrusted original.
 func sanitizeReadError(err error) error {
 	if err == nil {
 		return nil
 	}
 	switch {
-	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
-		return err
+	case errors.Is(err, context.Canceled):
+		return context.Canceled
+	case errors.Is(err, context.DeadlineExceeded):
+		return context.DeadlineExceeded
 	case errors.Is(err, dalrecord.ErrRecordNotFound):
-		return fmt.Errorf("%w: %w", ErrBackend, err)
-	case errors.Is(err, dal.ErrNotSupported), errors.Is(err, dal.ErrNotImplementedYet), errors.Is(err, ErrNotSupported):
-		return fmt.Errorf("%w: %w", ErrBackend, err)
-	case errors.Is(err, hrana.ErrLimit), errors.Is(err, hrana.ErrProtocol):
-		return err
-	case errors.Is(err, ErrInvalidConfig), errors.Is(err, ErrUnsafeTarget), errors.Is(err, ErrUnsupportedResponse):
-		return err
+		return fmt.Errorf("%w: %w", ErrBackend, dalrecord.ErrRecordNotFound)
+	case errors.Is(err, dal.ErrNotSupported):
+		return fmt.Errorf("%w: %w", ErrBackend, dal.ErrNotSupported)
+	case errors.Is(err, dal.ErrNotImplementedYet):
+		return fmt.Errorf("%w: %w", ErrBackend, dal.ErrNotImplementedYet)
+	case errors.Is(err, ErrNotSupported):
+		return fmt.Errorf("%w: %w", ErrBackend, ErrNotSupported)
+	case errors.Is(err, hrana.ErrLimit):
+		return hrana.ErrLimit
+	case errors.Is(err, hrana.ErrProtocol):
+		return hrana.ErrProtocol
+	case errors.Is(err, ErrInvalidConfig):
+		return ErrInvalidConfig
+	case errors.Is(err, ErrUnsafeTarget):
+		return ErrUnsafeTarget
+	case errors.Is(err, ErrUnsupportedResponse):
+		return ErrUnsupportedResponse
 	}
 	var protocolErr *hrana.Error
 	if errors.As(err, &protocolErr) {
-		return protocolErr
+		// *hrana.Error is built from fixed safe fields; the wrapper that carried
+		// it is not, and is dropped.
+		return &hrana.Error{
+			Op:     protocolErr.Op,
+			Status: protocolErr.Status,
+			Code:   protocolErr.Code,
+			Detail: protocolErr.Detail,
+		}
 	}
 	return ErrBackend
 }

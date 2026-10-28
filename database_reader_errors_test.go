@@ -11,8 +11,14 @@ import (
 
 	"github.com/dal-go/dalgo/dal"
 	"github.com/dal-go/dalgo/recordset"
+	"github.com/dal-go/dalgo2libsql/internal/hrana"
 	dalrecord "github.com/dal-go/record"
 )
+
+// untrustedText is what a transport or a delegate can put in an error it hands
+// back: server/payload text, SQL, a bearer token and a URL. None of it may
+// survive a recognized classification.
+const untrustedText = `HTTP 500: SELECT secret FROM tokens; Authorization: Bearer super-secret at https://db.example.com`
 
 // stubDelegate satisfies dal.DB by embedding the interface; only the two
 // reader constructors are reached, and every other method would panic if a
@@ -87,6 +93,35 @@ func requireOperationEnded(t *testing.T, delegate *stubDelegate) {
 	}
 }
 
+// requireNoUntrustedCause walks the whole error chain, including multiply
+// wrapped errors, and fails if any message or retained cause echoes the
+// synthetic secrets.
+func requireNoUntrustedCause(t *testing.T, err error) {
+	t.Helper()
+	seen := make(map[error]bool)
+	var walk func(error)
+	walk = func(e error) {
+		if e == nil || seen[e] {
+			return
+		}
+		seen[e] = true
+		for _, secret := range []string{"super-secret", "SELECT secret", "Bearer", "https://db.example.com"} {
+			if strings.Contains(e.Error(), secret) {
+				t.Fatalf("error chain echoes %q: %v", secret, e)
+			}
+		}
+		switch unwrapped := e.(type) {
+		case interface{ Unwrap() []error }:
+			for _, inner := range unwrapped.Unwrap() {
+				walk(inner)
+			}
+		case interface{ Unwrap() error }:
+			walk(unwrapped.Unwrap())
+		}
+	}
+	walk(err)
+}
+
 func requireSanitizedFailure(t *testing.T, err error) {
 	t.Helper()
 	if err == nil {
@@ -95,13 +130,154 @@ func requireSanitizedFailure(t *testing.T, err error) {
 	if !errors.Is(err, ErrBackend) {
 		t.Fatalf("error = %v, want ErrBackend", err)
 	}
-	for _, secret := range []string{"super-secret", "SELECT secret", "Bearer", "https://db.example.com"} {
-		if strings.Contains(err.Error(), secret) {
-			t.Fatalf("error echoes %q: %v", secret, err)
-		}
-	}
+	requireNoUntrustedCause(t, err)
 	if errors.Is(err, io.EOF) || errors.Is(err, dal.ErrNoMoreRecords) {
 		t.Fatalf("a failed read looks like exhaustion: %v", err)
+	}
+}
+
+// exerciseReaderBoundaries drives one probe error through every bounded reader
+// boundary: Next and Close of the records reader and of the recordset reader.
+// Every boundary must release its operation. The reported error is keyed by
+// boundary name.
+func exerciseReaderBoundaries(t *testing.T, probe error) map[string]error {
+	t.Helper()
+	results := make(map[string]error, 4)
+
+	recordsNext := &stubDelegate{recordsReader: &stubRecordsReader{
+		next: func() (dalrecord.Record, error) { return nil, probe },
+	}}
+	recordsReader, err := newStubDatabase(t, recordsNext).ExecuteQueryToRecordsReader(context.Background(), stubQuery())
+	if err != nil {
+		t.Fatalf("ExecuteQueryToRecordsReader: %v", err)
+	}
+	_, results["records Next"] = recordsReader.Next()
+	requireOperationEnded(t, recordsNext)
+	_ = recordsReader.Close()
+
+	recordsClose := &stubDelegate{recordsReader: &stubRecordsReader{
+		next:     func() (dalrecord.Record, error) { return nil, dal.ErrNoMoreRecords },
+		closeErr: probe,
+	}}
+	recordsReader, err = newStubDatabase(t, recordsClose).ExecuteQueryToRecordsReader(context.Background(), stubQuery())
+	if err != nil {
+		t.Fatalf("ExecuteQueryToRecordsReader: %v", err)
+	}
+	results["records Close"] = recordsReader.Close()
+	requireOperationEnded(t, recordsClose)
+
+	recordsetNext := &stubDelegate{recordsetReader: &stubRecordsetReader{
+		next: func() (recordset.Row, recordset.Recordset, error) { return nil, nil, probe },
+	}}
+	recordsetReader, err := newStubDatabase(t, recordsetNext).ExecuteQueryToRecordsetReader(context.Background(), stubQuery())
+	if err != nil {
+		t.Fatalf("ExecuteQueryToRecordsetReader: %v", err)
+	}
+	_, _, results["recordset Next"] = recordsetReader.Next()
+	requireOperationEnded(t, recordsetNext)
+	_ = recordsetReader.Close()
+
+	recordsetClose := &stubDelegate{recordsetReader: &stubRecordsetReader{
+		next:     func() (recordset.Row, recordset.Recordset, error) { return nil, nil, dal.ErrNoMoreRecords },
+		closeErr: probe,
+	}}
+	recordsetReader, err = newStubDatabase(t, recordsetClose).ExecuteQueryToRecordsetReader(context.Background(), stubQuery())
+	if err != nil {
+		t.Fatalf("ExecuteQueryToRecordsetReader: %v", err)
+	}
+	results["recordset Close"] = recordsetReader.Close()
+	requireOperationEnded(t, recordsetClose)
+
+	return results
+}
+
+// syntheticWrapper returns the classification wrapped in text that must not
+// survive sanitization.
+func syntheticWrapper(classification error) error {
+	return fmt.Errorf("%s: %w", untrustedText, classification)
+}
+
+// TestBoundedReadersReportCanonicalClassifications checks that every
+// recognized classification keeps its errors.Is identity at every reader
+// boundary without retaining the wrapper that carried it.
+func TestBoundedReadersReportCanonicalClassifications(t *testing.T) {
+	cases := []struct {
+		name           string
+		classification error
+		wantBackend    bool
+	}{
+		{"context canceled", context.Canceled, false},
+		{"context deadline exceeded", context.DeadlineExceeded, false},
+		{"record not found", dalrecord.ErrRecordNotFound, true},
+		{"dal not supported", dal.ErrNotSupported, true},
+		{"dal not implemented yet", dal.ErrNotImplementedYet, true},
+		{"adapter not supported", ErrNotSupported, true},
+		{"hrana limit", hrana.ErrLimit, false},
+		{"hrana protocol", hrana.ErrProtocol, false},
+		{"invalid configuration", ErrInvalidConfig, false},
+		{"unsafe target", ErrUnsafeTarget, false},
+		{"unsupported response", ErrUnsupportedResponse, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for boundary, got := range exerciseReaderBoundaries(t, syntheticWrapper(tc.classification)) {
+				t.Run(boundary, func(t *testing.T) {
+					if !errors.Is(got, tc.classification) {
+						t.Fatalf("error = %v, want the %v identity", got, tc.classification)
+					}
+					if errors.Is(got, ErrBackend) != tc.wantBackend {
+						t.Fatalf("errors.Is(error, ErrBackend) = %v, want %v (error = %v)",
+							errors.Is(got, ErrBackend), tc.wantBackend, got)
+					}
+					requireNoUntrustedCause(t, got)
+					if errors.Is(got, io.EOF) || errors.Is(got, dal.ErrNoMoreRecords) {
+						t.Fatalf("a classified failure looks like exhaustion: %v", got)
+					}
+				})
+			}
+		})
+	}
+}
+
+// TestBoundedReadersDropWrappedProtocolErrorText covers the *hrana.Error
+// classification, whose own fields are safe but whose wrapper is not.
+func TestBoundedReadersDropWrappedProtocolErrorText(t *testing.T) {
+	probe := syntheticWrapper(&hrana.Error{Op: "transport", Status: 500, Detail: "the request failed"})
+	for boundary, got := range exerciseReaderBoundaries(t, probe) {
+		t.Run(boundary, func(t *testing.T) {
+			var protocolErr *hrana.Error
+			if !errors.As(got, &protocolErr) {
+				t.Fatalf("error = %v, want a *hrana.Error", got)
+			}
+			if protocolErr.Op != "transport" || protocolErr.Status != 500 {
+				t.Fatalf("protocol error = %+v, want the original safe classification", protocolErr)
+			}
+			requireNoUntrustedCause(t, got)
+		})
+	}
+}
+
+// TestBoundedReadersTreatWrappedEndAsFailure keeps the exhaustion rule: only
+// the exact io.EOF and dal.ErrNoMoreRecords values are an end, and an error
+// wrapping either is a failure.
+func TestBoundedReadersTreatWrappedEndAsFailure(t *testing.T) {
+	for name, end := range map[string]error{
+		"io.EOF":               io.EOF,
+		"dal.ErrNoMoreRecords": dal.ErrNoMoreRecords,
+	} {
+		t.Run(name, func(t *testing.T) {
+			for boundary, got := range exerciseReaderBoundaries(t, fmt.Errorf("stream: %w", end)) {
+				t.Run(boundary, func(t *testing.T) {
+					if !errors.Is(got, ErrBackend) {
+						t.Fatalf("error = %v, want ErrBackend, not exhaustion", got)
+					}
+					if errors.Is(got, io.EOF) || errors.Is(got, dal.ErrNoMoreRecords) {
+						t.Fatalf("a wrapped end was reported as exhaustion: %v", got)
+					}
+				})
+			}
+		})
 	}
 }
 

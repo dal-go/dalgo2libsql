@@ -8,6 +8,8 @@ github.com/cockroachdb/cockroach-go/v2 v2.2.0 h1:/5znzg5n373N/3ESjHF5SMLxiW4RKB0
 github.com/cockroachdb/cockroach-go/v2 v2.2.0/go.mod h1:u3MiKYGupPPjkn3ozknpMUpxPaNLTFWAya419/zv6eI=
 github.com/dal-go/dalgo v0.95.4 h1:AjfaI7S/dreCfmZL8ybcahBlm8l8XVuJ25ZVLorfxxs=
 github.com/dal-go/dalgo v0.95.4/go.mod h1:UCGV7G50rWbXamWXbmbBGmHiACWtNYUFNIL+qM5AAs8=
+github.com/dal-go/dalgo v0.102.6 h1:iBogUOXpGe6N9ZvSnyWILLZ1YYPnJrWFvd6wiyjBkuY=
+github.com/dal-go/dalgo v0.102.6/go.mod h1:KmMQvq9i/7sz2bCH859CbQqgx2XalOi7n1oWMhWMYlc=
 github.com/dal-go/dalgo2sql v0.31.0 h1:HPIEtlxrPkg1DvuRQ/Zsv1/otFY7T/CWGPfUm+yCjsw=
 github.com/dal-go/dalgo2sql v0.31.0/go.mod h1:q/L7EXw7f1nnfn4aKfm3G5s0AJAkX0FNPyK3CdbLR28=
 github.com/dal-go/dalgo2sqlite v0.5.1 h1:fFrAnKRlYtSbUSBvzyWRFbLyhNIVesh5r1RiRnKzeuI=

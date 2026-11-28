@@ -3,7 +3,7 @@ module github.com/dal-go/dalgo2libsql
 go 1.26.0
 
 require (
-	github.com/dal-go/dalgo v0.102.6
+	github.com/dal-go/dalgo v0.104.0
 	github.com/dal-go/dalgo2sql v0.32.8
 	github.com/dal-go/dalgo2sqlite v0.6.5
 	github.com/dal-go/record v0.1.5
